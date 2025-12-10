@@ -64,7 +64,7 @@ async def upload(file: UploadFile = File(...)):
 
     df = pd.DataFrame()
 
-    # Try tabula with stream mode for text-based PDFs
+    # Try tabula with stream mode for better column detection
     try:
         dfs = tabula.read_pdf(str(input_path), pages="all", stream=True, multiple_tables=True, guess=False)
         if dfs and not all(d.empty for d in dfs):
@@ -73,14 +73,14 @@ async def upload(file: UploadFile = File(...)):
     except:
         pass
 
-    # Fallback: OCR with pytesseract
+    # Fallback: OCR with improved line parsing
     if df.empty:
         images = convert_from_bytes(contents)
         text = ""
         for img in images:
             text += pytesseract.image_to_string(img) + "\n"
         
-        # Improved line-by-line parser for HSBC format
+        # Improved parser for HSBC format
         lines = [line.strip() for line in text.split('\n') if line.strip()]
         data = []
         current_date = None
@@ -90,25 +90,42 @@ async def upload(file: UploadFile = File(...)):
         current_balance = ''
 
         for line in lines:
-            if re.match(r'\d{1,2} \w{3} 25', line):  # Detect dates like "15 Jun 25"
+            # Skip headers/footers
+            if re.match(r'(The Secretary|Account Name|Your BUSINESS CURRENT ACCOUNT details|Account Summary|Opening Balance|Payments In|Payments Out|Closing Balance|International Bank Account Number|Branch Identifier Code|Sortcode Account Number Sheet Number|46 The Broadway Ealing London W5 5JR|HSBC > UK|Contact tel|Text phone|used by deaf or speech impaired customers|www.hsbc.co.uk)', line):
+                continue
+
+            # Detect new date (e.g., "15 Jun 25")
+            date_match = re.match(r'(\d{1,2} \w{3} 25)', line)
+            if date_match:
                 if current_date:
                     data.append({"Date": current_date, "Description": current_desc.strip(), "Paid Out": current_paid_out, "Paid In": current_paid_in, "Balance": current_balance})
-                current_date = line
-                current_desc = ''
+                current_date = date_match.group(1)
+                current_desc = line.replace(current_date, '').strip()
                 current_paid_out = ''
                 current_paid_in = ''
                 current_balance = ''
-            elif re.match(r'^\d{1,3}(,\d{3})*?\.\d{2}$', line):  # Detect amounts or balances
-                if not current_paid_out:
-                    current_paid_out = line
-                elif not current_paid_in:
-                    current_paid_in = line
-                else:
-                    current_balance = line
+                continue
+
+            # Detect amounts (numbers with decimals)
+            amounts = re.findall(r'\d{1,3}(?:,\d{3})*\.\d{2}', line)
+            if amounts:
+                if len(amounts) == 1:
+                    if current_balance:
+                        current_paid_out = amounts[0] if "DR" in current_desc or "Visa Rate" in current_desc or "Transaction Fee" in current_desc else ''
+                    else:
+                        current_balance = amounts[0]
+                elif len(amounts) == 2:
+                    current_paid_out = amounts[0]
+                    current_paid_in = amounts[1]
+                elif len(amounts) == 3:
+                    current_paid_out = amounts[0]
+                    current_paid_in = amounts[1]
+                    current_balance = amounts[2]
             else:
-                if "BALANCE BROUGHT FORWARD" in line or "BALANCE CARRIED FORWARD" in line or "Account Summary" in line or "Opening Balance" in line or "Closing Balance" in line or "Sortcode" in line or "Sheet Number" in line:
-                    continue
-                current_desc += ' ' + line if current_desc else line
+                if current_desc:
+                    current_desc += ' ' + line
+                else:
+                    current_desc = line
 
         # Add the last entry
         if current_date:
