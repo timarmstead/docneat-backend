@@ -1,10 +1,10 @@
 FROM python:3.11-slim
 
-# Install system deps for pdf2image and pytesseract
-RUN apt-get update && apt-get install -y \
+# Update and install system deps for OCR (split for better error handling)
+RUN apt-get update
+RUN apt-get install -y --no-install-recommends \
     tesseract-ocr \
     poppler-utils \
-    libgl1-mesa-glx \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
