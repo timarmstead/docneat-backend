@@ -6,3 +6,4 @@ pytesseract
 pdf2image
 pillow
 openpyxl
+python-multipart
