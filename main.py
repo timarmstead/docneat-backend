@@ -8,17 +8,14 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 import re
 import uuid
-import shutil
 from pathlib import Path
 import io
 
 app = FastAPI()
 
-# Fix CORS properly
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -28,7 +25,7 @@ OUTPUT_DIR = Path("/tmp/outputs")
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'  # Railway has it pre-installed
+pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
 def clean_dataframe(df):
     if df.empty:
@@ -54,7 +51,6 @@ async def upload(file: UploadFile = File(...)):
 
     df = pd.DataFrame()
 
-    # Try tabula first
     try:
         dfs = tabula.read_pdf(str(input_path), pages="all", lattice=True, multiple_tables=True)
         if dfs and not all(d.empty for d in dfs):
@@ -63,7 +59,6 @@ async def upload(file: UploadFile = File(...)):
     except:
         pass
 
-    # Fallback: OCR with pytesseract
     if df.empty:
         images = convert_from_bytes(contents)
         text = ""
