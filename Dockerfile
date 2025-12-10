@@ -1,20 +1,25 @@
 FROM python:3.11-slim
 
-# Update and install system deps for OCR (split for better error handling)
-RUN apt-get update
-RUN apt-get install -y --no-install-recommends \
+# Install minimal system deps for OCR (faster, less memory)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     poppler-utils \
-    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Copy requirements first for better caching
 COPY requirements.txt .
+
+# Install Python deps with no cache (saves memory)
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy code
 COPY . .
+
+# Make entrypoint executable
+RUN chmod +x entrypoint.sh
 
 EXPOSE $PORT
 
-CMD sh -c "uvicorn main:app --host 0.0.0.0 --port $PORT"
+CMD ["./entrypoint.sh"]
