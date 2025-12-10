@@ -50,7 +50,7 @@ def clean_dataframe(df):
     # Drop empty or header rows
     df = df.dropna(how="all")
     df = df[~df['Description'].str.contains('BALANCE BROUGHT FORWARD|BALANCE CARRIED FORWARD|Account Summary|Opening Balance|Closing Balance|Sortcode|Sheet Number|HSBC > UK|Contact tel|Text phone|www.hsbc.co.uk|Y our Statement', na=False, case=False)]
-    df = df[df['Amount'] != 0]  # Drop zero amounts if not needed
+    df = df[df['Amount'] != 0]  # Drop zero amounts
     df = df.reset_index(drop=True)
     return df
 
@@ -65,23 +65,14 @@ async def upload(file: UploadFile = File(...)):
 
     df = pd.DataFrame()
 
-    # Try tabula with multiple modes
+    # Try tabula with custom column positions for HSBC layout
     try:
-        dfs = tabula.read_pdf(str(input_path), pages="all", stream=True, multiple_tables=True, guess=False)
+        dfs = tabula.read_pdf(str(input_path), pages="all", stream=True, multiple_tables=True, guess=False, columns=[100, 350, 450, 500, 550], area=(100, 0, 700, 600))
         if dfs and not all(d.empty for d in dfs):
             df = pd.concat([d for d in dfs if not d.empty], ignore_index=True)
             df = clean_dataframe(df)
     except:
         pass
-
-    if df.empty:
-        try:
-            dfs = tabula.read_pdf(str(input_path), pages="all", lattice=True, multiple_tables=True, guess=False)
-            if dfs and not all(d.empty for d in dfs):
-                df = pd.concat([d for d in dfs if not d.empty], ignore_index=True)
-                df = clean_dataframe(df)
-        except:
-            pass
 
     # Fallback: OCR with improved parser
     if df.empty:
@@ -102,7 +93,7 @@ async def upload(file: UploadFile = File(...)):
 
         for line in lines:
             # Detect new date (e.g., "15 Jun 25")
-            date_match = re.match(r'(\d{1,2} \w{3} 25)', line)
+            date_match = re.match(r'\d{1,2} \w{3} 25', line)
             if date_match:
                 if current_date:
                     amount = float(current_paid_in or 0) - float(current_paid_out or 0)
@@ -114,25 +105,26 @@ async def upload(file: UploadFile = File(...)):
                         'Balance': current_balance,
                         'Amount': amount
                     })
-                current_date = date_match.group(1)
-                current_desc = ''
+                current_date = date_match.group(0)
+                current_desc = line.replace(current_date, '').strip()
                 current_paid_out = ''
                 current_paid_in = ''
                 current_balance = ''
                 continue
 
-            # Detect amounts (find numbers with decimals)
+            # Detect amounts (find numbers with decimals, remove commas)
             amounts = re.findall(r'\d{1,3}(?:,\d{3})*?\.\d{2}', line)
+            amounts = [float(a.replace(',', '')) for a in amounts]  # Remove commas and convert to float
             if amounts:
                 if len(amounts) == 1:
                     current_balance = amounts[0]
                 elif len(amounts) == 2:
                     current_paid_out = amounts[0]
                     current_paid_in = amounts[1]
-                elif len(amounts) == 3:
+                elif len(amounts) >= 3:
                     current_paid_out = amounts[0]
                     current_paid_in = amounts[1]
-                    current_balance = amounts[2]
+                    current_balance = amounts[-1]
                 line = re.sub(r'\d{1,3}(?:,\d{3})*?\.\d{2}', '', line).strip()
             # Append to description
             if line:
@@ -143,7 +135,7 @@ async def upload(file: UploadFile = File(...)):
                 # Append to current desc, but look for the amount in the line
                 amount_match = re.search(r'\d{1,3}(?:,\d{3})*?\.\d{2}', line)
                 if amount_match:
-                    amount = amount_match.group(0)
+                    amount = float(amount_match.group(0).replace(',', ''))
                     if 'Visa Rate' in line or 'Transaction Fee' in line:
                         current_paid_out = amount
 
@@ -178,4 +170,4 @@ async def download(name: str):
 
 @app.get("/")
 def root():
-    return {"message": "DocNeat Backend Ready!"}
+    return {"message": "DocNeat Backend Ready v4!"}
