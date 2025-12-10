@@ -1,23 +1,39 @@
-FROM python:3.11-slim
+# Stage 1: Install system deps and build
+FROM python:3.11-slim as builder
 
-# Install minimal system deps for OCR (faster, less memory)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     poppler-utils \
+    libglib2.0-0 \
+    libgl1-mesa-glx \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy requirements first for better caching
 COPY requirements.txt .
-
-# Install Python deps with no cache (saves memory)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy code
+# Stage 2: Runtime (lightweight)
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    poppler-utils \
+    libglib2.0-0 \
+    libgl1-mesa-glx \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy built deps from stage 1
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
 COPY . .
 
-# Make entrypoint executable
+# Entry script for $PORT expansion
+COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
 EXPOSE $PORT
