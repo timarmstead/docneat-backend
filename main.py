@@ -49,7 +49,7 @@ def clean_dataframe(df):
         df["Date"] = pd.to_datetime(df["Date"], errors='coerce', dayfirst=True)
     # Drop empty or header rows
     df = df.dropna(how="all")
-    df = df[~df['Description'].str.contains('BALANCE BROUGHT FORWARD|BALANCE CARRIED FORWARD|Account Summary|Opening Balance|Closing Balance|Sortcode|Sheet Number|HSBC > UK|Contact tel|Text phone|www.hsbc.co.uk', na=False, case=False)]
+    df = df[~df['Description'].str.contains('BALANCE BROUGHT FORWARD|BALANCE CARRIED FORWARD|Account Summary|Opening Balance|Closing Balance|Sortcode|Sheet Number|HSBC > UK|Contact tel|Text phone|www.hsbc.co.uk|Y our Statement', na=False, case=False)]
     df = df[df['Amount'] != 0]  # Drop zero amounts if not needed
     df = df.reset_index(drop=True)
     return df
@@ -65,7 +65,7 @@ async def upload(file: UploadFile = File(...)):
 
     df = pd.DataFrame()
 
-    # Try tabula with multiple modes for better extraction
+    # Try tabula with multiple modes
     try:
         dfs = tabula.read_pdf(str(input_path), pages="all", stream=True, multiple_tables=True, guess=False)
         if dfs and not all(d.empty for d in dfs):
@@ -83,17 +83,16 @@ async def upload(file: UploadFile = File(...)):
         except:
             pass
 
-    # Fallback: OCR with improved transaction splitting
+    # Fallback: OCR with improved parser
     if df.empty:
         images = convert_from_bytes(contents)
         text = ""
         for img in images:
             text += pytesseract.image_to_string(img) + "\n"
         
-        # Split into lines and filter noise
-        lines = [line.strip() for line in text.split('\n') if line.strip() and not re.match(r'(The Secretary|Account Name|Your BUSINESS CURRENT ACCOUNT details|Account Summary|Opening Balance|Payments In|Payments Out|Closing Balance|International Bank Account Number|Branch Identifier Code|Sortcode Account Number Sheet Number|46 The Broadway Ealing London W5 5JR|HSBC > UK|Contact tel|Text phone|used by deaf or speech impaired customers|www.hsbc.co.uk|Y our Statement)', line)]
-
         # Improved parser: process line by line
+        lines = [line.strip() for line in text.split('\n') if line.strip() and not re.match(r'(The Secretary|Account Name|Your BUSINESS CURRENT ACCOUNT details|Account Summary|Opening Balance|Payments In|Payments Out|Closing Balance|International Bank Account Number|Branch Identifier Code|Sortcode|Sheet Number|46 The Broadway Ealing London W5 5JR|HSBC > UK|Contact tel|Text phone|used by deaf or speech impaired customers|www.hsbc.co.uk)', line)]
+
         data = []
         current_date = None
         current_desc = ''
@@ -102,19 +101,27 @@ async def upload(file: UploadFile = File(...)):
         current_balance = ''
 
         for line in lines:
-            # Detect new transaction with date
+            # Detect new date (e.g., "15 Jun 25")
             date_match = re.match(r'(\d{1,2} \w{3} 25)', line)
             if date_match:
-                if current_date and current_desc:
-                    data.append({"Date": current_date, "Description": current_desc.strip(), "Paid Out": current_paid_out, "Paid In": current_paid_in, "Balance": current_balance})
+                if current_date:
+                    amount = float(current_paid_in or 0) - float(current_paid_out or 0)
+                    data.append({
+                        'Date': current_date,
+                        'Description': current_desc.strip(),
+                        'Paid Out': current_paid_out,
+                        'Paid In': current_paid_in,
+                        'Balance': current_balance,
+                        'Amount': amount
+                    })
                 current_date = date_match.group(1)
-                current_desc = line.replace(current_date, '').strip()
+                current_desc = ''
                 current_paid_out = ''
                 current_paid_in = ''
                 current_balance = ''
                 continue
 
-            # Detect amounts (look for lines with multiple numbers)
+            # Detect amounts (find numbers with decimals)
             amounts = re.findall(r'\d{1,3}(?:,\d{3})*?\.\d{2}', line)
             if amounts:
                 if len(amounts) == 1:
@@ -122,24 +129,35 @@ async def upload(file: UploadFile = File(...)):
                 elif len(amounts) == 2:
                     current_paid_out = amounts[0]
                     current_paid_in = amounts[1]
-                elif len(amounts) >= 3:
+                elif len(amounts) == 3:
                     current_paid_out = amounts[0]
                     current_paid_in = amounts[1]
-                    current_balance = amounts[-1]
-            # Append to description if not a number line
-            else:
-                if current_desc:
-                    current_desc += ' ' + line
-                else:
-                    current_desc = line
+                    current_balance = amounts[2]
+                line = re.sub(r'\d{1,3}(?:,\d{3})*?\.\d{2}', '', line).strip()
+            # Append to description
+            if line:
+                current_desc += ' ' + line if current_desc else line
 
-            # If line contains 'DR Non-Sterling' or 'Visa Rate', add to description
-            if 'DR Non-Sterling' in line or 'Visa Rate' in line:
-                current_desc += ' ' + line
+            # Handle special lines like "Visa Rate" or "DR Non-Sterling"
+            if 'Visa Rate' in line or 'DR Non-Sterling' in line:
+                # Append to current desc, but look for the amount in the line
+                amount_match = re.search(r'\d{1,3}(?:,\d{3})*?\.\d{2}', line)
+                if amount_match:
+                    amount = amount_match.group(0)
+                    if 'Visa Rate' in line or 'Transaction Fee' in line:
+                        current_paid_out = amount
 
         # Add the last entry
-        if current_date and current_desc:
-            data.append({"Date": current_date, "Description": current_desc.strip(), "Paid Out": current_paid_out, "Paid In": current_paid_in, "Balance": current_balance})
+        if current_date:
+            amount = float(current_paid_in or 0) - float(current_paid_out or 0)
+            data.append({
+                'Date': current_date,
+                'Description': current_desc.strip(),
+                'Paid Out': current_paid_out,
+                'Paid In': current_paid_in,
+                'Balance': current_balance,
+                'Amount': amount
+            })
 
         df = pd.DataFrame(data)
         df = clean_dataframe(df)
