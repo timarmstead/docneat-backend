@@ -2,5 +2,8 @@ fastapi
 uvicorn
 pandas
 tabula-py
-easyocr
+pytesseract
+pdf2image
+pillow
 openpyxl
+pytesseract
