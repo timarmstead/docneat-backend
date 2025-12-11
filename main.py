@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # CORS middleware with specific origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.docneat.com", "https://docneat-frontend.vercel.app", "http://localhost:3000"],  # Add local for testing
+    allow_origins=["https://www.docneat.com", "https://docneat-frontend.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
