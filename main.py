@@ -2,7 +2,7 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import pandas as pd
-import tabula
+import camelot
 import pytesseract
 from pdf2image import convert_from_bytes
 import re
@@ -65,16 +65,16 @@ async def upload(file: UploadFile = File(...)):
 
     df = pd.DataFrame()
 
-    # Try tabula with custom column positions for HSBC layout
+    # Try camelot for table extraction (better for complex layouts)
     try:
-        dfs = tabula.read_pdf(str(input_path), pages="all", stream=True, multiple_tables=True, guess=False, columns=[100, 350, 450, 500, 550], area=(100, 0, 700, 600))
-        if dfs and not all(d.empty for d in dfs):
-            df = pd.concat([d for d in dfs if not d.empty], ignore_index=True)
+        tables = camelot.read_pdf(str(input_path), flavor='stream', pages='all')
+        if tables and not all(t.df.empty for t in tables):
+            df = pd.concat([t.df for t in tables if not t.df.empty], ignore_index=True)
             df = clean_dataframe(df)
     except:
         pass
 
-    # Fallback: OCR with improved parser
+    # Fallback: OCR with pytesseract
     if df.empty:
         images = convert_from_bytes(contents)
         text = ""
@@ -170,4 +170,4 @@ async def download(name: str):
 
 @app.get("/")
 def root():
-    return {"message": "DocNeat Backend Ready v4!"}
+    return {"message": "DocNeat Backend Ready v5!"}
