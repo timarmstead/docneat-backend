@@ -35,6 +35,7 @@ pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 def clean_dataframe(df):
     if df.empty:
         return df
+    # Standardize columns
     df.columns = [col.strip() for col in df.columns]
     col_map = {
         "Date": "Date",
@@ -44,15 +45,18 @@ def clean_dataframe(df):
         "Balance": "Balance"
     }
     df = df.rename(columns=col_map)
+    # Compute net Amount
     if "Paid Out" in df.columns and "Paid In" in df.columns:
         df['Paid Out'] = pd.to_numeric(df['Paid Out'].str.replace(',', '').str.replace('£', ''), errors='coerce').fillna(0)
         df['Paid In'] = pd.to_numeric(df['Paid In'].str.replace(',', '').str.replace('£', ''), errors='coerce').fillna(0)
         df['Amount'] = df['Paid In'] - df['Paid Out']
+    # Parse dates
     if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors='coerce', dayfirst=True)
+        df["Date"] = pd.to_datetime(df["Date"], errors='coerce', dayfirst=True, infer_datetime_format=True)  # Suppress warning
+    # Drop empty or header rows
     df = df.dropna(how="all")
     df = df[~df['Description'].str.contains('BALANCE BROUGHT FORWARD|BALANCE CARRIED FORWARD|Account Summary|Opening Balance|Closing Balance|Sortcode|Sheet Number|HSBC > UK|Contact tel|Text phone|www.hsbc.co.uk|Y our Statement', na=False, case=False)]
-    df = df[df['Amount'] != 0]
+    df = df[df['Amount'] != 0]  # Drop zero amounts if not needed
     df = df.reset_index(drop=True)
     return df
 
@@ -148,11 +152,11 @@ async def upload(file: UploadFile = File(...)):
         logger.error(f"Error in upload: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error — check logs")
 
-@app.get("/download/{file_id}")
-async def download(file_id: str):
-    file = OUTPUT_DIR / f"{file_id}.xlsx"
+@app.get("/download/{name}")
+async def download(name: str):
+    file = OUTPUT_DIR / name
     return FileResponse(file, filename="docneat-converted.xlsx")
 
 @app.get("/")
 def root():
-    return {"message": "DocNeat Backend Ready v6!"}
+    return {"message": "DocNeat Backend Ready v7!"}
