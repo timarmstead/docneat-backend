@@ -2,7 +2,7 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import pandas as pd
-import tabula
+import camelot
 import pytesseract
 from pdf2image import convert_from_bytes
 import re
@@ -12,10 +12,9 @@ import io
 
 app = FastAPI()
 
-# CORS middleware added here, before any routes
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Or specify ["https://www.docneat.com", "https://docneat-frontend.vercel.app"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,11 +66,11 @@ async def upload(file: UploadFile = File(...)):
 
     df = pd.DataFrame()
 
-    # Try tabula with stream mode for text-based PDFs
+    # Try camelot for table extraction (better for complex layouts)
     try:
-        dfs = tabula.read_pdf(str(input_path), pages="all", stream=True, multiple_tables=True, guess=False)
-        if dfs and not all(d.empty for d in dfs):
-            df = pd.concat([d for d in dfs if not d.empty], ignore_index=True)
+        tables = camelot.read_pdf(str(input_path), flavor='stream', pages='all')
+        if tables and not all(t.df.empty for t in tables):
+            df = pd.concat([t.df for t in tables if not t.df.empty], ignore_index=True)
             df = clean_dataframe(df)
     except:
         pass
@@ -114,7 +113,7 @@ async def upload(file: UploadFile = File(...)):
                 current_balance = ''
                 continue
 
-            # Detect amounts (find numbers with decimals)
+            # Detect amounts (find numbers with decimals, remove commas)
             amounts = re.findall(r'\d{1,3}(?:,\d{3})*?\.\d{2}', line)
             amounts = [float(a.replace(',', '')) for a in amounts]  # Remove commas and convert to float
             if amounts:
@@ -159,11 +158,11 @@ async def upload(file: UploadFile = File(...)):
         "excel_url": f"/download/{excel_path.name}"
     }
 
-@app.get("/download/{excel_path.name}")
+@app.get("/download/{name}")
 async def download(name: str):
     file = OUTPUT_DIR / name
     return FileResponse(file, filename="docneat-converted.xlsx")
 
 @app.get("/")
 def root():
-    return {"message": "DocNeat Backend Ready v6!"}  # Changed to v6 to confirm update
+    return {"message": "DocNeat Backend Ready v6!"}
