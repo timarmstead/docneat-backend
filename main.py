@@ -1,6 +1,6 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response  # NEW: Import Response for HEAD
 import pandas as pd
 import pytesseract
 from pdf2image import convert_from_bytes
@@ -8,18 +8,12 @@ import re
 import uuid
 from pathlib import Path
 import io
-import logging  # Added for error logging
 
 app = FastAPI()
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# CORS middleware with specific origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.docneat.com", "https://docneat-frontend.vercel.app"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,7 +29,6 @@ pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 def clean_dataframe(df):
     if df.empty:
         return df
-    # Standardize columns
     df.columns = [col.strip() for col in df.columns]
     col_map = {
         "Date": "Date",
@@ -45,15 +38,12 @@ def clean_dataframe(df):
         "Balance": "Balance"
     }
     df = df.rename(columns=col_map)
-    # Compute net Amount
     if "Paid Out" in df.columns and "Paid In" in df.columns:
         df['Paid Out'] = pd.to_numeric(df['Paid Out'].str.replace(',', '').str.replace('£', ''), errors='coerce').fillna(0)
         df['Paid In'] = pd.to_numeric(df['Paid In'].str.replace(',', '').str.replace('£', ''), errors='coerce').fillna(0)
         df['Amount'] = df['Paid In'] - df['Paid Out']
-    # Parse dates
     if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors='coerce', dayfirst=True, infer_datetime_format=True)  # Suppress warning
-    # Drop empty or header rows
+        df["Date"] = pd.to_datetime(df["Date"], errors='coerce', dayfirst=True)
     df = df.dropna(how="all")
     df = df[~df['Description'].str.contains('BALANCE BROUGHT FORWARD|BALANCE CARRIED FORWARD|Account Summary|Opening Balance|Closing Balance|Sortcode|Sheet Number|HSBC > UK|Contact tel|Text phone|www.hsbc.co.uk|Y our Statement', na=False, case=False)]
     df = df[df['Amount'] != 0]  # Drop zero amounts if not needed
@@ -62,24 +52,33 @@ def clean_dataframe(df):
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
+    file_id = str(uuid.uuid4())
+    input_path = UPLOAD_DIR / f"{file.filename}"
+    
+    contents = await file.read()
+    with open(input_path, "wb") as f:
+        f.write(contents)
+
+    df = pd.DataFrame()
+
+    # Try camelot for table extraction
     try:
-        file_id = str(uuid.uuid4())
-        input_path = UPLOAD_DIR / f"{file.filename}"
-        
-        contents = await file.read()
-        with open(input_path, "wb") as f:
-            f.write(contents)
+        tables = camelot.read_pdf(str(input_path), flavor='stream', pages='all')
+        if tables and not all(t.df.empty for t in tables):
+            df = pd.concat([t.df for t in tables if not t.df.empty], ignore_index=True)
+            df = clean_dataframe(df)
+    except:
+        pass
 
-        df = pd.DataFrame()
-
-        # OCR fallback (since camelot may need it for scanned PDFs)
+    # Fallback: OCR with pytesseract
+    if df.empty:
         images = convert_from_bytes(contents)
         text = ""
         for img in images:
             text += pytesseract.image_to_string(img) + "\n"
         
-        # Parser logic (you can replace with camelot here if needed)
-        lines = [line.strip() for line in text.split('\n') if line.strip() and not re.match(r'(The Secretary|Account Name|Your BUSINESS CURRENT ACCOUNT details|Account Summary|Opening Balance|Payments In|Payments Out|Closing Balance|International Bank Account Number|Branch Identifier Code|Sortcode|Sheet Number|46 The Broadway Ealing London W5 5JR|HSBC > UK|Contact tel|Text phone|used by deaf or speech impaired customers|www.hsbc.co.uk)', line)]
+        # Improved line-by-line parser for HSBC format
+        lines = [line.strip() for line in text.split('\n') if line.strip() and not re.match(r'(The Secretary|Account Name|Your BUSINESS CURRENT ACCOUNT details|Account Summary|Opening Balance|Payments In|Payments Out|Closing Balance|International Bank Account Number|Branch Identifier Code|Sortcode|Sheet Number|46 The Broadway Ealing London W5 5JR|HSBC > UK|Contact tel|Text phone|www.hsbc.co.uk)', line)]
 
         data = []
         current_date = None
@@ -89,7 +88,7 @@ async def upload(file: UploadFile = File(...)):
         current_balance = ''
 
         for line in lines:
-            date_match = re.match(r'(\d{1,2} \w{3} 25)', line)
+            date_match = re.match(r'\d{1,2} \w{3} 25', line)
             if date_match:
                 if current_date:
                     amount = float(current_paid_in or 0) - float(current_paid_out or 0)
@@ -101,7 +100,7 @@ async def upload(file: UploadFile = File(...)):
                         'Balance': current_balance,
                         'Amount': amount
                     })
-                current_date = date_match.group(1)
+                current_date = date_match.group(0)
                 current_desc = line.replace(current_date, '').strip()
                 current_paid_out = ''
                 current_paid_in = ''
@@ -109,7 +108,7 @@ async def upload(file: UploadFile = File(...)):
                 continue
 
             amounts = re.findall(r'\d{1,3}(?:,\d{3})*?\.\d{2}', line)
-            amounts = [float(a.replace(',', '')) for a in amounts]
+            amounts = [float(a.replace(',', '')) for a in amounts]  # Remove commas and convert to float
             if amounts:
                 if len(amounts) == 1:
                     if 'Visa Rate' in line or 'Transaction Fee' in line:
@@ -127,6 +126,7 @@ async def upload(file: UploadFile = File(...)):
             if line:
                 current_desc += ' ' + line if current_desc else line
 
+        # Add the last entry
         if current_date:
             amount = float(current_paid_in or 0) - float(current_paid_out or 0)
             data.append({
@@ -141,16 +141,14 @@ async def upload(file: UploadFile = File(...)):
         df = pd.DataFrame(data)
         df = clean_dataframe(df)
 
-        excel_path = OUTPUT_DIR / f"{file_id}.xlsx"
-        df.to_excel(excel_path, index=False)
+    # Save Excel
+    excel_path = OUTPUT_DIR / f"{file_id}.xlsx"
+    df.to_excel(excel_path, index=False)
 
-        return {
-            "preview": df.head(3).to_dict(orient="records"),
-            "excel_url": f"/download/{file_id}.xlsx"
-        }
-    except Exception as e:
-        logger.error(f"Error in upload: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error — check logs")
+    return {
+        "preview": df.head(3).to_dict(orient="records"),
+        "excel_url": f"/download/{excel_path.name}"
+    }
 
 @app.get("/download/{name}")
 async def download(name: str):
@@ -159,4 +157,8 @@ async def download(name: str):
 
 @app.get("/")
 def root():
-    return {"message": "DocNeat Backend Ready v7!"}
+    return {"message": "DocNeat Backend Ready v8!"}
+
+@app.head("/")  # NEW: Handle HEAD requests for UptimeRobot pings
+def root_head():
+    return Response(status_code=200)  # Returns 200 OK with no body
