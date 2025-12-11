@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 pandas
-tabula-py
+camelot-py[base]
 pytesseract
 pdf2image
 pillow
