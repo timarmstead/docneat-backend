@@ -8,9 +8,9 @@ from pdf2image import convert_from_bytes
 import re
 import uuid
 from pathlib import Path
-import io
 import boto3
 import os
+import numpy as np
 from typing import List, Dict
 
 app = FastAPI()
@@ -174,7 +174,7 @@ async def upload(file: UploadFile = File(...)):
         current_balance = ''
 
         for line in lines:
-            date_match = re.match(r'\d{1,2} \w{3} \d{2}', line)  # General date pattern
+            date_match = re.match(r'\d{1,2} \w{3} \d{2}', line)
             if date_match:
                 if current_date:
                     amount = float(current_paid_in or 0) - float(current_paid_out or 0)
@@ -233,8 +233,15 @@ async def upload(file: UploadFile = File(...)):
     df.to_excel(excel_path, index=False)
     df.to_csv(csv_path, index=False)
 
+    # Safe preview: replace NaN/inf/-inf with None before JSON serialization
+    preview_data = (
+        df.head(3)
+          .replace([np.nan, np.inf, -np.inf], None)
+          .to_dict(orient="records")
+    )
+
     return {
-        "preview": df.head(3).to_dict(orient="records"),
+        "preview": preview_data,
         "excel_url": f"/download/{excel_path.name}",
         "csv_url": f"/download/{csv_path.name}"
     }
