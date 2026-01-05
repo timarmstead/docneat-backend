@@ -7,3 +7,4 @@ pdf2image
 pillow
 openpyxl
 python-multipart
+boto3
