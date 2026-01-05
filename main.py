@@ -260,4 +260,4 @@ async def download(name: str):
 
 @app.get("/")
 def root():
-    return {"message": "DocNeat Backend Ready v7 - Textract + CSV support"}
+    return {"message": "DocNeat Backend Ready v8 - Textract + CSV support"}
