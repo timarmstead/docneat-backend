@@ -13,7 +13,6 @@ from typing import List, Dict
 
 app = FastAPI()
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,7 +36,6 @@ textract = boto3.client(
 )
 
 def extract_tables_from_textract(response: Dict) -> List[pd.DataFrame]:
-    """Parse Textract response to extract tables as DataFrames."""
     blocks = response.get('Blocks', [])
     tables = []
     cell_map = {block['Id']: block for block in blocks if block['BlockType'] == 'CELL'}
@@ -45,19 +43,14 @@ def extract_tables_from_textract(response: Dict) -> List[pd.DataFrame]:
 
     for table_block in table_blocks:
         table_data = {}
-        max_row = 0
-        max_col = 0
-        
+        max_row, max_col = 0, 0
         for rel in table_block.get('Relationships', []):
             if rel['Type'] == 'CHILD':
                 for cell_id in rel['Ids']:
                     cell = cell_map.get(cell_id)
                     if cell:
-                        r = cell.get('RowIndex', 0)
-                        c = cell.get('ColumnIndex', 0)
-                        max_row = max(max_row, r)
-                        max_col = max(max_col, c)
-                        
+                        r, c = cell.get('RowIndex', 0), cell.get('ColumnIndex', 0)
+                        max_row, max_col = max(max_row, r), max(max_col, c)
                         text = ''
                         for child_rel in cell.get('Relationships', []):
                             if child_rel['Type'] == 'CHILD':
@@ -65,116 +58,112 @@ def extract_tables_from_textract(response: Dict) -> List[pd.DataFrame]:
                                     word_block = next((b for b in blocks if b['Id'] == word_id), None)
                                     if word_block and 'Text' in word_block:
                                         text += word_block['Text'] + ' '
-                        
                         table_data[(r, c)] = text.strip()
-
         grid = []
         for r in range(1, max_row + 1):
-            row = [table_data.get((r, c), "") for c in range(1, max_col + 1)]
-            grid.append(row)
-            
+            grid.append([table_data.get((r, c), "") for c in range(1, max_col + 1)])
         if grid:
-            # We don't set headers yet, we clean the raw grid first
-            df = pd.DataFrame(grid)
-            tables.append(df)
-            
+            tables.append(pd.DataFrame(grid))
     return tables
 
 def clean_dataframe(df):
-    """
-    Strict filter to remove addresses and bank metadata.
-    Only keeps rows that look like bank transactions.
-    """
-    if df.empty:
-        return df
-
-    # 1. Identify rows that start with a Date (e.g., 15 Sep 25)
-    # This is the most reliable way to kill the 'Secretary' and 'Address' rows
+    if df.empty: return pd.DataFrame()
+    
     date_regex = r'\d{1,2}\s[A-Za-z]{3}\s\d{2}'
+    col_types = {}
     
-    # Check first column for date
-    is_transaction = df.iloc[:, 0].astype(str).str.contains(date_regex, na=False)
+    # 1. Dynamically find the Date Column
+    for c in range(df.shape[1]):
+        if df.iloc[:, c].astype(str).str.contains(date_regex, na=False).any():
+            col_types['Date'] = c
+            break
+    if 'Date' not in col_types: return pd.DataFrame()
+
+    # 2. Dynamically find Money Columns (Out, In, Balance)
+    money_cols = []
+    for c in range(col_types['Date'] + 1, df.shape[1]):
+        sample = df.iloc[:, c].astype(str).str.replace(r'[£,\s]', '', regex=True)
+        if pd.to_numeric(sample, errors='coerce').notnull().sum() > 0:
+            money_cols.append(c)
     
-    # 2. Filter the dataframe
-    df = df[is_transaction].copy()
+    if len(money_cols) >= 3:
+        col_types['Balance'], col_types['Paid In'], col_types['Paid Out'] = money_cols[-1], money_cols[-2], money_cols[-3]
+    elif len(money_cols) == 2:
+        col_types['Paid In'], col_types['Paid Out'] = money_cols[-1], money_cols[-2]
+    elif len(money_cols) == 1:
+        col_types['Paid Out'] = money_cols[0]
 
-    if df.empty:
-        return df
+    # Description is everything between Date and first Money column
+    m_start = min(money_cols) if money_cols else df.shape[1]
+    col_types['Desc_Idx'] = list(range(col_types['Date'] + 1, m_start))
 
-    # 3. Handle Column Names - Force Competitor Format
-    # We drop any extra columns Textract might have hallucinated
-    df = df.iloc[:, :5] 
-    df.columns = ['Date', 'Description', 'Paid Out', 'Paid In', 'Balance']
+    # 3. Process Rows & Merge Multi-line Descriptions
+    transactions = []
+    curr = None
+    first_date_row = df.iloc[:, col_types['Date']].astype(str).str.contains(date_regex, na=False).idxmax()
+    
+    for i in range(first_date_row, len(df)):
+        row = df.iloc[i]
+        date_match = re.search(date_regex, str(row.iloc[col_types['Date']]))
+        
+        if date_match:
+            if curr: transactions.append(curr)
+            desc = " ".join([str(row.iloc[idx]) for idx in col_types['Desc_Idx'] if str(row.iloc[idx]).lower() != 'nan']).strip()
+            curr = {
+                'Date': date_match.group(),
+                'Description': desc,
+                'Paid Out': str(row.iloc[col_types.get('Paid Out', -1)]) if 'Paid Out' in col_types else "0",
+                'Paid In': str(row.iloc[col_types.get('Paid In', -1)]) if 'Paid In' in col_types else "0",
+                'Balance': str(row.iloc[col_types.get('Balance', -1)]) if 'Balance' in col_types else "0"
+            }
+        elif curr: # Continuation line
+            desc = " ".join([str(row.iloc[idx]) for idx in col_types['Desc_Idx'] if str(row.iloc[idx]).lower() != 'nan']).strip()
+            if desc: curr['Description'] += " " + desc
+            for k in ['Paid Out', 'Paid In', 'Balance']:
+                if k in col_types:
+                    val = str(row.iloc[col_types[k]]).strip()
+                    if val and val.lower() != 'nan' and curr[k] in ['0', '0.0', '']:
+                        curr[k] = val
 
-    # 4. Clean Numeric Values
-    for col in ['Paid Out', 'Paid In', 'Balance']:
-        df[col] = df[col].astype(str).str.replace(r'[£,]', '', regex=True)
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-    # 5. Drop Noise Phrases
-    noise = ['BALANCE BROUGHT FORWARD', 'BALANCE CARRIED FORWARD', 'Account Summary']
-    pattern = '|'.join(noise)
-    df = df[~df['Description'].astype(str).str.contains(pattern, case=False, na=False)]
-
-    return df.reset_index(drop=True)
+    if curr: transactions.append(curr)
+    
+    # 4. Final Formatting
+    res = pd.DataFrame(transactions)
+    if not res.empty:
+        for col in ['Paid Out', 'Paid In', 'Balance']:
+            res[col] = pd.to_numeric(res[col].astype(str).str.replace(r'[£,]', '', regex=True), errors='coerce').fillna(0)
+        # Nuke standard bank noise
+        res = res[~res['Description'].str.contains('BALANCE BROUGHT FORWARD|Account Summary', case=False, na=False)]
+        return res[['Date', 'Description', 'Paid Out', 'Paid In', 'Balance']]
+    return pd.DataFrame()
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     file_id = str(uuid.uuid4())
     input_path = UPLOAD_DIR / f"{file.filename}"
-    
     contents = await file.read()
-    with open(input_path, "wb") as f:
-        f.write(contents)
+    with open(input_path, "wb") as f: f.write(contents)
 
-    final_df = pd.DataFrame()
-
+    cleaned_list = []
     try:
-        response = textract.analyze_document(
-            Document={'Bytes': contents},
-            FeatureTypes=['TABLES']
-        )
-        raw_tables = extract_tables_from_textract(response)
-        
-        cleaned_list = []
-        for table in raw_tables:
-            cleaned = clean_dataframe(table)
-            if not cleaned.empty:
-                cleaned_list.append(cleaned)
-        
-        if cleaned_list:
-            final_df = pd.concat(cleaned_list, ignore_index=True)
-            
-    except Exception as e:
-        print(f"Extraction error: {e}")
+        response = textract.analyze_document(Document={'Bytes': contents}, FeatureTypes=['TABLES'])
+        for table in extract_tables_from_textract(response):
+            cl = clean_dataframe(table)
+            if not cl.empty: cleaned_list.append(cl)
+    except Exception as e: print(f"Error: {e}")
 
-    # Fallback to Camelot
-    if final_df.empty:
-        try:
-            tables = camelot.read_pdf(str(input_path), flavor='stream', pages='all')
-            cleaned_list = [clean_dataframe(t.df) for t in tables]
-            final_df = pd.concat(cleaned_list, ignore_index=True)
-        except:
-            pass
-
-    # Save ONLY CSV as requested
+    final_df = pd.concat(cleaned_list, ignore_index=True) if cleaned_list else pd.DataFrame()
     csv_path = OUTPUT_DIR / f"{file_id}.csv"
     final_df.to_csv(csv_path, index=False)
 
-    preview_data = final_df.head(5).replace([np.nan, np.inf, -np.inf], None).to_dict(orient="records")
-
     return {
-        "preview": preview_data,
+        "preview": final_df.head(10).replace([np.nan, np.inf, -np.inf], None).to_dict(orient="records"),
         "csv_url": f"/download/{csv_path.name}"
     }
 
 @app.get("/download/{name}")
 async def download(name: str):
-    file = OUTPUT_DIR / name
-    if not file.exists():
-        return {"error": "File not found"}
-    return FileResponse(file, media_type="text/csv", filename="docneat-converted.csv")
+    return FileResponse(OUTPUT_DIR / name, media_type="text/csv", filename="docneat-transactions.csv")
 
 @app.get("/")
-def root():
-    return {"message": "DocNeat API - Clean Mode Active"}
+def root(): return {"status": "DocNeat Logic Hardened"}
