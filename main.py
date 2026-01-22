@@ -1,17 +1,16 @@
-from fastapi import FastAPI, File, UploadFile, Request
+from fastapi import FastAPI, File, UploadFile, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 import pandas as pd
 import re
-import uuid
 import boto3
 import os
 import numpy as np
-from pathlib import Path
+import io
 
 app = FastAPI()
 
-# FULL CORS - This ensures the frontend and backend can talk without being blocked
+# Robust CORS for browser-server communication
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,11 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = Path("/tmp/uploads")
-OUTPUT_DIR = Path("/tmp/outputs")
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-
 textract = boto3.client(
     'textract',
     region_name=os.getenv('AWS_REGION', 'us-east-1'),
@@ -32,55 +26,48 @@ textract = boto3.client(
     aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
 )
 
-def process_hsbc_logic(df):
+def clean_hsbc_logic(df):
+    """Specific parser for HSBC transaction rows [cite: 1, 354, 371]"""
     if df.empty: return pd.DataFrame()
     date_regex = r'\d{1,2}\s[A-Za-z]{3}\s\d{2}'
-    txns = []
-    last_date = None
+    transactions = []
+    current_date = None
     
     for _, row in df.iterrows():
         vals = [str(v).strip() for v in row.values]
-        
-        # Date Logic
         d_match = re.search(date_regex, vals[0])
-        if d_match: last_date = d_match.group()
+        if d_match: current_date = d_match.group()
         
-        # Description (Col 1 or 2)
+        # Column mapping based on standard HSBC PDF layout [cite: 1, 13]
         desc = vals[1] if vals[1].lower() != 'nan' and vals[1] != "" else (vals[2] if len(vals) > 2 else "")
-        
-        # Money (HSBC standard cols)
-        out_v = vals[3].replace(',','').replace('£','') if len(vals) > 3 else ""
-        in_v = vals[4].replace(',','').replace('£','') if len(vals) > 4 else ""
-        bal_v = vals[5].replace(',','').replace('£','') if len(vals) > 5 else ""
+        p_out = vals[3].replace(',','').replace('£','') if len(vals) > 3 else "0"
+        p_in = vals[4].replace(',','').replace('£','') if len(vals) > 4 else "0"
+        bal = vals[5].replace(',','').replace('£','') if len(vals) > 5 else "0"
 
-        if last_date and (desc or out_v or in_v):
-            is_new = any(c.isdigit() for c in (out_v + in_v))
-            if not is_new and txns and last_date == txns[-1]['Date']:
-                txns[-1]['Description'] += " " + desc
+        if current_date and (desc or p_out != "0" or p_in != "0"):
+            # Multi-line handling for 'Non-Sterling' fees [cite: 361, 362]
+            is_new_txn = any(c.isdigit() for c in (p_out + p_in))
+            if not is_new_txn and transactions and current_date == transactions[-1]['Date']:
+                transactions[-1]['Description'] += " " + desc
             else:
-                txns.append({
-                    'Date': last_date,
-                    'Description': desc,
-                    'Paid Out': out_v if out_v else "0",
-                    'Paid In': in_v if in_v else "0",
-                    'Balance': bal_v if bal_v else "0"
+                transactions.append({
+                    'Date': current_date, 'Description': desc,
+                    'Paid Out': p_out, 'Paid In': p_in, 'Balance': bal
                 })
-    return pd.DataFrame(txns)
+    return pd.DataFrame(transactions)
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    file_id = str(uuid.uuid4())
     try:
-        # Read file
-        contents = await file.read()
+        # Read into memory directly
+        file_bytes = await file.read()
         
-        # 1. AWS Textract
-        response = textract.analyze_document(Document={'Bytes': contents}, FeatureTypes=['TABLES'])
+        # 1. AWS Textract processing
+        response = textract.analyze_document(Document={'Bytes': file_bytes}, FeatureTypes=['TABLES'])
         
-        # 2. Extract Tables
         blocks = response.get('Blocks', [])
         bmap = {b['Id']: b for b in blocks}
-        all_dfs = []
+        dfs = []
         
         for table in [b for b in blocks if b['BlockType'] == 'TABLE']:
             rows = {}
@@ -88,43 +75,34 @@ async def upload(file: UploadFile = File(...)):
                 for cid in rel['Ids']:
                     cell = bmap[cid]
                     r, c = cell['RowIndex'], cell['ColumnIndex']
-                    txt = " ".join([bmap[w]['Text'] for r2 in cell.get('Relationships', []) for w in r2['Ids']])
-                    rows.setdefault(r, {})[c] = txt
+                    text = " ".join([bmap[w]['Text'] for r2 in cell.get('Relationships', []) for w in r2['Ids']])
+                    rows.setdefault(r, {})[c] = text
             
-            df = pd.DataFrame.from_dict(rows, orient='index').sort_index(axis=1)
-            all_dfs.append(process_hsbc_logic(df))
+            raw_df = pd.DataFrame.from_dict(rows, orient='index').sort_index(axis=1)
+            dfs.append(clean_hsbc_logic(raw_df))
 
-        if not all_dfs:
-            return JSONResponse(status_code=400, content={"error": "No tables detected"})
+        if not dfs:
+            return JSONResponse(status_code=400, content={"error": "No data found in PDF"})
 
-        final_df = pd.concat(all_dfs, ignore_index=True)
+        final_df = pd.concat(dfs, ignore_index=True)
+        
+        # 2. Cleanup and JSON safety formatting [cite: 371]
         for col in ['Paid Out', 'Paid In', 'Balance']:
             final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0.0)
-
-        # 3. JSON Safe Conversion (Fixes the NaN/Inf crash)
-        preview = final_df.head(20).replace([np.nan, np.inf, -np.inf], None).to_dict(orient="records")
         
-        csv_filename = f"{file_id}.csv"
-        csv_path = OUTPUT_DIR / csv_filename
-        final_df.to_csv(csv_path, index=False)
+        preview_data = final_df.head(20).replace([np.nan, np.inf, -np.inf], None).to_dict(orient="records")
 
-        # Note: Frontend expects 'csv_url' to look like this
+        # 3. Create CSV in memory (No disk writing = no 500 errors)
+        stream = io.StringIO()
+        final_df.to_csv(stream, index=False)
+        
         return {
-            "preview": preview,
-            "csv_url": f"/download/{csv_filename}"
+            "preview": preview_data,
+            "csv_content": stream.getvalue() # Send the actual CSV data to the frontend
         }
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# Fixed Route for Download
-@app.get("/download/{name}")
-async def download(name: str):
-    file_path = OUTPUT_DIR / name
-    if file_path.exists():
-        return FileResponse(file_path, media_type="text/csv", filename="bank_statement.csv")
-    return JSONResponse(status_code=404, content={"error": "File not found"})
-
 @app.get("/")
-def root():
-    return {"status": "DocNeat Live", "engine": "V17"}
+def health(): return {"status": "DocNeat V18 Engine Active"}
