@@ -13,7 +13,7 @@ from typing import List, Dict
 
 app = FastAPI()
 
-# Enable CORS for frontend integration
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -58,7 +58,6 @@ def extract_tables_from_textract(response: Dict) -> List[pd.DataFrame]:
                         max_row = max(max_row, r)
                         max_col = max(max_col, c)
                         
-                        # Extract text from words within the cell
                         text = ''
                         for child_rel in cell.get('Relationships', []):
                             if child_rel['Type'] == 'CHILD':
@@ -69,62 +68,53 @@ def extract_tables_from_textract(response: Dict) -> List[pd.DataFrame]:
                         
                         table_data[(r, c)] = text.strip()
 
-        # Build DataFrame from grid
         grid = []
         for r in range(1, max_row + 1):
             row = [table_data.get((r, c), "") for c in range(1, max_col + 1)]
             grid.append(row)
             
         if grid:
-            df = pd.DataFrame(grid[1:], columns=grid[0])
+            # We don't set headers yet, we clean the raw grid first
+            df = pd.DataFrame(grid)
             tables.append(df)
             
     return tables
 
 def clean_dataframe(df):
     """
-    Strict cleaning logic to match competitor output.
-    Removes headers, footers, and non-transaction rows.
+    Strict filter to remove addresses and bank metadata.
+    Only keeps rows that look like bank transactions.
     """
     if df.empty:
         return df
 
-    # Standardize column names
-    df.columns = [str(col).strip().replace('\n', ' ') for col in df.columns]
+    # 1. Identify rows that start with a Date (e.g., 15 Sep 25)
+    # This is the most reliable way to kill the 'Secretary' and 'Address' rows
+    date_regex = r'\d{1,2}\s[A-Za-z]{3}\s\d{2}'
     
-    # Map messy headers to standard names (matches bankstatementconverter sample)
-    col_map = {
-        "Date": "Date",
-        "Payment type and details": "Description",
-        "Pay m e nt t y pe and de t ails": "Description", # Handle Textract artifacts
-        "Paid out": "Paid Out",
-        "Paid in": "Paid In",
-        "Balance": "Balance"
-    }
-    df = df.rename(columns=col_map)
+    # Check first column for date
+    is_transaction = df.iloc[:, 0].astype(str).str.contains(date_regex, na=False)
+    
+    # 2. Filter the dataframe
+    df = df[is_transaction].copy()
 
-    # 1. Date Anchor Filter: Every transaction MUST start with a date (e.g., '15 Sep 25')
-    # This automatically deletes addresses, IBANs, and footers.
-    date_pattern = r'\d{1,2}\s[A-Za-z]{3}\s\d{2}'
-    df = df[df['Date'].astype(str).str.contains(date_pattern, na=False)]
+    if df.empty:
+        return df
 
-    # 2. Description Noise Filter: Remove internal bank markers
-    noise_phrases = [
-        'Account Summary', 'Opening Balance', 'Closing Balance', 
-        'Sortcode', 'Sheet Number', 'www.hsbc.co.uk', 'Your Statement'
-    ]
-    pattern = '|'.join(noise_phrases)
-    df = df[~df['Description'].astype(str).str.contains(pattern, case=False, na=False)]
+    # 3. Handle Column Names - Force Competitor Format
+    # We drop any extra columns Textract might have hallucinated
+    df = df.iloc[:, :5] 
+    df.columns = ['Date', 'Description', 'Paid Out', 'Paid In', 'Balance']
 
-    # 3. Numeric Formatting: Remove currency symbols and commas
+    # 4. Clean Numeric Values
     for col in ['Paid Out', 'Paid In', 'Balance']:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(r'[£,]', '', regex=True)
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        df[col] = df[col].astype(str).str.replace(r'[£,]', '', regex=True)
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # 4. Final calculation for net Amount
-    if 'Paid Out' in df.columns and 'Paid In' in df.columns:
-        df['Amount'] = df['Paid In'] - df['Paid Out']
+    # 5. Drop Noise Phrases
+    noise = ['BALANCE BROUGHT FORWARD', 'BALANCE CARRIED FORWARD', 'Account Summary']
+    pattern = '|'.join(noise)
+    df = df[~df['Description'].astype(str).str.contains(pattern, case=False, na=False)]
 
     return df.reset_index(drop=True)
 
@@ -137,53 +127,54 @@ async def upload(file: UploadFile = File(...)):
     with open(input_path, "wb") as f:
         f.write(contents)
 
-    df = pd.DataFrame()
+    final_df = pd.DataFrame()
 
-    # Step 1: AWS Textract (Primary Extraction)
     try:
         response = textract.analyze_document(
             Document={'Bytes': contents},
             FeatureTypes=['TABLES']
         )
-        tables = extract_tables_from_textract(response)
-        if tables:
-            df = pd.concat(tables, ignore_index=True)
-            df = clean_dataframe(df)
+        raw_tables = extract_tables_from_textract(response)
+        
+        cleaned_list = []
+        for table in raw_tables:
+            cleaned = clean_dataframe(table)
+            if not cleaned.empty:
+                cleaned_list.append(cleaned)
+        
+        if cleaned_list:
+            final_df = pd.concat(cleaned_list, ignore_index=True)
+            
     except Exception as e:
-        print(f"Textract error: {e}")
+        print(f"Extraction error: {e}")
 
-    # Step 2: Fallback to Camelot if Textract fails or returns empty
-    if df.empty:
+    # Fallback to Camelot
+    if final_df.empty:
         try:
             tables = camelot.read_pdf(str(input_path), flavor='stream', pages='all')
-            if tables:
-                df = pd.concat([t.df for t in tables], ignore_index=True)
-                df = clean_dataframe(df)
+            cleaned_list = [clean_dataframe(t.df) for t in tables]
+            final_df = pd.concat(cleaned_list, ignore_index=True)
         except:
             pass
 
-    # Save outputs
-    excel_path = OUTPUT_DIR / f"{file_id}.xlsx"
+    # Save ONLY CSV as requested
     csv_path = OUTPUT_DIR / f"{file_id}.csv"
-    
-    df.to_excel(excel_path, index=False)
-    df.to_csv(csv_path, index=False)
+    final_df.to_csv(csv_path, index=False)
 
-    preview_data = df.head(5).replace([np.nan, np.inf, -np.inf], None).to_dict(orient="records")
+    preview_data = final_df.head(5).replace([np.nan, np.inf, -np.inf], None).to_dict(orient="records")
 
     return {
         "preview": preview_data,
-        "excel_url": f"/download/{excel_path.name}",
         "csv_url": f"/download/{csv_path.name}"
     }
 
 @app.get("/download/{name}")
 async def download(name: str):
     file = OUTPUT_DIR / name
-    media_type = "text/csv" if file.suffix == '.csv' else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    filename = f"docneat-converted{file.suffix}"
-    return FileResponse(file, media_type=media_type, filename=filename)
+    if not file.exists():
+        return {"error": "File not found"}
+    return FileResponse(file, media_type="text/csv", filename="docneat-converted.csv")
 
 @app.get("/")
 def root():
-    return {"message": "DocNeat Backend Refactored - Clean Extraction Active"}
+    return {"message": "DocNeat API - Clean Mode Active"}
