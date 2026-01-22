@@ -1,10 +1,6 @@
 fastapi
 uvicorn
-pandas
-camelot-py[base]
-pytesseract
-pdf2image
-pillow
-openpyxl
 python-multipart
+pandas
 boto3
+numpy
