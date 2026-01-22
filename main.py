@@ -5,7 +5,7 @@ import uuid
 import boto3
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -19,7 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Clients
 s3 = boto3.client('s3',
     aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
     aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
@@ -39,25 +38,40 @@ def parse_hsbc_logic(df):
     date_regex = r'\d{1,2}\s[A-Za-z]{3}\s\d{2}'
     txns = []
     current_date = None
+    
     for _, row in df.iterrows():
-        vals = [str(v).strip() for v in row.values]
+        # Ensure all values are strings and handle NaNs
+        vals = [str(v).strip() if v is not None else "" for v in row.values]
+        if not vals: continue
+        
         d_match = re.search(date_regex, vals[0])
-        if d_match: current_date = d_match.group()
-        desc = vals[1] if vals[1].lower() != 'nan' and vals[1] != "" else (vals[2] if len(vals) > 2 else "")
-        p_out = vals[3].replace(',','').replace('£','').strip() if len(vals) > 3 else ""
-        p_in = vals[4].replace(',','').replace('£','').strip() if len(vals) > 4 else ""
+        if d_match:
+            current_date = d_match.group()
+            
+        desc = vals[1] if len(vals) > 1 and vals[1].lower() != 'nan' else ""
+        p_out = vals[3].replace(',','').replace('£','').strip() if len(vals) > 3 else "0"
+        p_in = vals[4].replace(',','').replace('£','').strip() if len(vals) > 4 else "0"
         bal = vals[5].replace(',','').replace('£','').strip() if len(vals) > 5 else ""
-        if current_date and (desc or p_out or p_in):
-            if any(c.isdigit() for c in (p_out + p_in)):
-                txns.append({'Date': current_date, 'Description': desc, 'Paid Out': p_out or "0", 'Paid In': p_in or "0", 'Balance': bal or ""})
+
+        if current_date and (desc or p_out != "0" or p_in != "0"):
+            has_money = any(c.isdigit() for c in (str(p_out) + str(p_in)))
+            if has_money:
+                txns.append({
+                    'Date': current_date, 
+                    'Description': desc, 
+                    'Paid Out': p_out if p_out else "0", 
+                    'Paid In': p_in if p_in else "0", 
+                    'Balance': bal
+                })
             elif txns:
                 txns[-1]['Description'] += " " + desc
     return pd.DataFrame(txns)
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    """STEP 1: Uploads to S3 and starts Textract. Returns JobId immediately."""
-    file_key = f"uploads/{uuid.uuid4()}-{file.filename}"
+    # Clean filename to avoid URL issues
+    clean_name = re.sub(r'[^a-zA-Z0-9.]', '_', file.filename)
+    file_key = f"uploads/{uuid.uuid4()}-{clean_name}"
     try:
         content = await file.read()
         s3.put_object(Bucket=BUCKET_NAME, Key=file_key, Body=content)
@@ -66,26 +80,23 @@ async def upload(file: UploadFile = File(...)):
             DocumentLocation={'S3Object': {'Bucket': BUCKET_NAME, 'Name': file_key}},
             FeatureTypes=['TABLES']
         )
-        # We return the JobId and the FileKey so the frontend can check status
         return {"job_id": response['JobId'], "file_key": file_key}
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": f"Upload Failed: {str(e)}"})
 
 @app.get("/status/{job_id}")
-async def get_status(job_id: str, file_key: str):
-    """STEP 2: Called by the frontend to check if the PDF is done."""
+async def get_status(job_id: str, file_key: str = Query(...)):
     try:
         response = textract.get_document_analysis(JobId=job_id)
         status = response['JobStatus']
         
         if status == 'IN_PROGRESS':
             return {"status": "PROCESSING"}
-        
         if status == 'FAILED':
-            return {"status": "FAILED"}
+            return {"status": "FAILED", "error": "AWS Textract failed to process the file."}
 
         if status == 'SUCCEEDED':
-            # Collect all pages of results
+            # Collect results
             pages = [response]
             next_token = response.get('NextToken')
             while next_token:
@@ -93,7 +104,6 @@ async def get_status(job_id: str, file_key: str):
                 pages.append(next_page)
                 next_token = next_page.get('NextToken')
             
-            # Parse all tables
             all_dfs = []
             for pg in pages:
                 blocks = pg.get('Blocks', [])
@@ -106,18 +116,27 @@ async def get_status(job_id: str, file_key: str):
                             r, c = cell['RowIndex'], cell['ColumnIndex']
                             txt = " ".join([bmap[w]['Text'] for r2 in cell.get('Relationships', []) for w in r2['Ids'] if bmap[w]['BlockType'] == 'WORD'])
                             grid.setdefault(r, {})[c] = txt
-                    df_raw = pd.DataFrame.from_dict(grid, orient='index').sort_index(axis=1)
-                    all_dfs.append(parse_hsbc_logic(df_raw))
+                    
+                    if grid:
+                        df_raw = pd.DataFrame.from_dict(grid, orient='index').sort_index(axis=1)
+                        processed = parse_hsbc_logic(df_raw)
+                        if not processed.empty:
+                            all_dfs.append(processed)
 
-            # Immediate Cleanup
-            s3.delete_object(Bucket=BUCKET_NAME, Key=file_key)
+            # Cleanup S3
+            try:
+                s3.delete_object(Bucket=BUCKET_NAME, Key=file_key)
+            except:
+                pass
 
             if not all_dfs:
-                return {"status": "COMPLETED", "preview": [], "csv_content": ""}
+                return {"status": "COMPLETED", "preview": [], "csv_content": "", "message": "No transaction tables found."}
 
             final_df = pd.concat(all_dfs, ignore_index=True)
-            for col in ['Paid Out', 'Paid In', 'Balance']:
-                final_df[col] = pd.to_numeric(final_df[col].replace('', '0'), errors='coerce').fillna(0.0)
+            
+            # Final numeric cleanup
+            for col in ['Paid Out', 'Paid In']:
+                final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0.0)
 
             return {
                 "status": "COMPLETED",
@@ -126,8 +145,9 @@ async def get_status(job_id: str, file_key: str):
             }
             
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        # This is where we catch the specific parsing error
+        print(f"DEBUG ERROR: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": f"Parsing Error: {str(e)}"})
 
 @app.get("/")
-def health():
-    return {"status": "V26 Multi-Endpoint Active"}
+def health(): return {"status": "V27 - Robust Parsing"}
