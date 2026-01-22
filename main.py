@@ -91,36 +91,41 @@ async def get_status(job_id: str, file_key: str = Query(...)):
         if status == 'IN_PROGRESS':
             return {"status": "PROCESSING"}
         if status == 'FAILED':
-            return {"status": "FAILED", "error": "AWS Textract failed."}
+            return {"status": "FAILED"}
 
         if status == 'SUCCEEDED':
-            pages = [response]
+            # 1. Collect ALL pages first
+            all_blocks = response.get('Blocks', [])
             next_token = response.get('NextToken')
             while next_token:
                 next_page = textract.get_document_analysis(JobId=job_id, NextToken=next_token)
-                pages.append(next_page)
+                all_blocks.extend(next_page.get('Blocks', []))
                 next_token = next_page.get('NextToken')
             
+            # 2. Build a GLOBAL map of all IDs across all pages
+            bmap = {b['Id']: b for b in all_blocks}
+            
+            # 3. Process tables using the global map
             all_dfs = []
-            for pg in pages:
-                blocks = pg.get('Blocks', [])
-                bmap = {b['Id']: b for b in blocks}
-                
-                for table in [b for b in blocks if b['BlockType'] == 'TABLE']:
+            for block in all_blocks:
+                if block['BlockType'] == 'TABLE':
                     grid = {}
-                    if 'Relationships' not in table: continue
+                    if 'Relationships' not in block: continue
                     
-                    for rel in table['Relationships']:
-                        for cid in rel['Ids']:
-                            cell = bmap[cid]
-                            # FIX: Check if RowIndex/ColumnIndex exist to prevent 'RowIndex' KeyError
-                            if 'RowIndex' in cell and 'ColumnIndex' in cell:
-                                r, c = cell['RowIndex'], cell['ColumnIndex']
-                                txt = ""
-                                if 'Relationships' in cell:
-                                    for r2 in cell['Relationships']:
-                                        txt += " ".join([bmap[w]['Text'] for w in r2['Ids'] if bmap[w]['BlockType'] == 'WORD'])
-                                grid.setdefault(r, {})[c] = txt.strip()
+                    for rel in block['Relationships']:
+                        for cell_id in rel['Ids']:
+                            cell = bmap.get(cell_id)
+                            if not cell or 'RowIndex' not in cell: continue
+                            
+                            r, c = cell['RowIndex'], cell['ColumnIndex']
+                            text = ""
+                            if 'Relationships' in cell:
+                                for child_rel in cell['Relationships']:
+                                    for word_id in child_rel['Ids']:
+                                        word_block = bmap.get(word_id)
+                                        if word_block and word_block['BlockType'] == 'WORD':
+                                            text += word_block['Text'] + " "
+                            grid.setdefault(r, {})[c] = text.strip()
                     
                     if grid:
                         df_raw = pd.DataFrame.from_dict(grid, orient='index').sort_index(axis=1)
@@ -128,6 +133,7 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                         if not processed.empty:
                             all_dfs.append(processed)
 
+            # Cleanup S3
             try:
                 s3.delete_object(Bucket=BUCKET_NAME, Key=file_key)
             except:
@@ -145,7 +151,7 @@ async def get_status(job_id: str, file_key: str = Query(...)):
             
     except Exception as e:
         print(f"DEBUG ERROR: {str(e)}")
-        return JSONResponse(status_code=500, content={"error": f"Parsing Error: {str(e)}"})
+        return JSONResponse(status_code=500, content={"error": f"Internal Error: {str(e)}"})
 
 @app.get("/")
-def health(): return {"status": "V28 - Defensive Table Builder"}
+def health(): return {"status": "V29 - Global ID Mapping"}
