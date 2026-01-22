@@ -4,15 +4,13 @@ from fastapi.responses import FileResponse
 import pandas as pd
 import re
 import uuid
-from pathlib import Path
 import boto3
 import os
 import numpy as np
-from typing import List, Dict
+from pathlib import Path
 
 app = FastAPI()
 
-# Standard CORS setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,6 +24,7 @@ OUTPUT_DIR = Path("/tmp/outputs")
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+# Initialize AWS with simpler config
 textract = boto3.client(
     'textract',
     region_name=os.getenv('AWS_REGION', 'us-east-1'),
@@ -33,129 +32,115 @@ textract = boto3.client(
     aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
 )
 
-def clean_bank_data(df):
-    """Refined logic to handle multi-line transactions like Non-Sterling Fees."""
+def parse_hsbc_table(df):
+    """The 'Competitor-Grade' parser: ensures sub-lines like fees are captured."""
     if df.empty: return pd.DataFrame()
     
     date_regex = r'\d{1,2}\s[A-Za-z]{3}\s\d{2}'
-    data_rows = []
-    last_date = None
+    clean_rows = []
+    current_date = None
     
-    # Identify money columns by looking for numeric content
-    money_cols = []
-    for c in range(df.shape[1]):
-        col_str = "".join(df.iloc[:, c].astype(str)).replace(',', '')
-        if any(char.isdigit() for char in col_str):
-            money_cols.append(c)
-    
-    if len(money_cols) < 1: return pd.DataFrame()
-    
-    out_idx = money_cols[0]
-    in_idx = money_cols[1] if len(money_cols) > 1 else out_idx
-    bal_idx = money_cols[-1]
+    for _, row in df.iterrows():
+        # Convert row to list of strings and strip whitespace
+        vals = [str(v).strip() for v in row.values]
+        line_text = " ".join(vals)
+        
+        # Skip header/footer noise
+        if any(x in line_text for x in ["Account Summary", "Sheet Number", "HBUKGB"]): continue
+        
+        # Look for date
+        date_found = re.search(date_regex, vals[0])
+        if date_found:
+            current_date = date_found.group()
+        
+        # Dynamically find money (last 3 columns usually)
+        # We filter out empty strings and 'nan'
+        money_vals = []
+        for v in vals[1:]:
+            clean_v = v.replace(',', '').replace('£', '')
+            if clean_v and any(c.isdigit() for c in clean_v) and not re.search(date_regex, v):
+                money_vals.append(clean_v)
 
-    for i in range(len(df)):
-        row = df.iloc[i].astype(str).tolist()
-        # Clean up 'nan' strings from Textract
-        row = ["" if x.lower() == 'nan' else x for x in row]
+        # Description is usually in the middle
+        desc = vals[1] if len(vals) > 1 else ""
         
-        date_match = re.search(date_regex, row[0])
-        if date_match:
-            last_date = date_match.group()
-        
-        # Extract description (usually column 1 or 2)
-        desc = row[1] if row[1].strip() else (row[2] if len(row) > 2 else "")
-        
-        # Extract and clean money
-        p_out = row[out_idx].replace(',', '').replace('£', '').strip()
-        p_in = row[in_idx].replace(',', '').replace('£', '').strip()
-        bal = row[bal_idx].replace(',', '').replace('£', '').strip()
-
-        if last_date and (desc.strip() or p_out or p_in):
-            data_rows.append({
-                'Date': last_date,
-                'Description': desc.strip(),
-                'Paid Out': p_out,
-                'Paid In': p_in,
-                'Balance': bal
+        if current_date and (desc or money_vals):
+            clean_rows.append({
+                'Date': current_date,
+                'Description': desc,
+                'MoneyRaw': money_vals,
+                'FullRow': vals
             })
 
-    # Merge multi-line descriptions (the 'Competitor' fix)
-    final_rows = []
-    for r in data_rows:
-        # If no money on this line, append description to previous transaction
-        if not r['Paid Out'] and not r['Paid In'] and final_rows and r['Date'] == final_rows[-1]['Date']:
-            if r['Description']:
-                final_rows[-1]['Description'] += " " + r['Description']
+    # Grouping Logic: Merge lines that belong together
+    final_transactions = []
+    for entry in clean_rows:
+        # If this line has no money but the previous one did, it might be a sub-description
+        # OR if this line HAS money but NO date, it's a new transaction on the same date
+        is_new_txn = any(any(c.isdigit() for c in m) for m in entry['MoneyRaw'])
+        
+        if not is_new_txn and final_transactions:
+            final_transactions[-1]['Description'] += " " + entry['Description']
         else:
-            final_rows.append(r)
+            # Try to map MoneyRaw to Out/In/Balance
+            m = entry['MoneyRaw']
+            final_transactions.append({
+                'Date': entry['Date'],
+                'Description': entry['Description'],
+                'Paid Out': m[0] if len(m) == 3 else (m[0] if len(m) == 1 else "0"),
+                'Paid In': m[1] if len(m) == 3 else "0",
+                'Balance': m[-1] if len(m) > 0 else "0"
+            })
 
-    res_df = pd.DataFrame(final_rows)
-    if not res_df.empty:
-        for col in ['Paid Out', 'Paid In', 'Balance']:
-            res_df[col] = pd.to_numeric(res_df[col], errors='coerce').fillna(0.0)
-        # Filter out bank summary headers
-        noise = ['BALANCE BROUGHT FORWARD', 'Account Summary', 'Sheet Number']
-        res_df = res_df[~res_df['Description'].str.contains('|'.join(noise), case=False, na=False)]
-    
-    return res_df
+    return pd.DataFrame(final_transactions)
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     file_id = str(uuid.uuid4())
-    input_path = UPLOAD_DIR / f"{file.filename}"
-    contents = await file.read()
-    with open(input_path, "wb") as f: f.write(contents)
-
-    all_dfs = []
     try:
-        # 1. Get Textract Response
-        response = textract.analyze_document(Document={'Bytes': contents}, FeatureTypes=['TABLES'])
-        blocks = response.get('Blocks', [])
-        block_map = {b['Id']: b for b in blocks}
+        contents = await file.read()
         
-        # 2. Extract Tables
-        for table_block in [b for b in blocks if b['BlockType'] == 'TABLE']:
-            table_data = {}
-            max_row, max_col = 0, 0
-            for rel in table_block.get('Relationships', []):
-                if rel['Type'] == 'CHILD':
-                    for cell_id in rel['Ids']:
-                        cell = block_map.get(cell_id)
-                        if not cell: continue
-                        r, c = cell['RowIndex'], cell['ColumnIndex']
-                        max_row, max_col = max(max_row, r), max(max_col, c)
-                        text = " ".join([block_map[w]['Text'] for rc in cell.get('Relationships', []) if rc['Type'] == 'CHILD' for w in rc['Ids'] if w in block_map])
-                        table_data[(r, c)] = text.strip()
+        # Call Textract
+        response = textract.analyze_document(Document={'Bytes': contents}, FeatureTypes=['TABLES'])
+        
+        # Map blocks
+        blocks = response.get('Blocks', [])
+        bmap = {b['Id']: b for b in blocks}
+        
+        all_data = []
+        for table in [b for b in blocks if b['BlockType'] == 'TABLE']:
+            rows = {}
+            for rel in table.get('Relationships', []):
+                for cid in rel['Ids']:
+                    cell = bmap[cid]
+                    r, c = cell['RowIndex'], cell['ColumnIndex']
+                    txt = " ".join([bmap[w]['Text'] for r2 in cell.get('Relationships', []) for w in r2['Ids']])
+                    rows.setdefault(r, {})[c] = txt
             
-            grid = [[table_data.get((r, c), "") for c in range(1, max_col + 1)] for r in range(1, max_row + 1)]
-            if grid:
-                cleaned = clean_bank_data(pd.DataFrame(grid))
-                if not cleaned.empty:
-                    all_dfs.append(cleaned)
+            df = pd.DataFrame.from_dict(rows, orient='index').sort_index(axis=1)
+            all_data.append(parse_hsbc_table(df))
+
+        if not all_data:
+            return {"error": "No transaction tables found in document."}
+
+        final_df = pd.concat(all_data, ignore_index=True)
+        
+        # Final formatting
+        for col in ['Paid Out', 'Paid In', 'Balance']:
+            final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0.0)
+
+        # JSON Safe Preview
+        preview = final_df.head(15).replace([np.nan, np.inf, -np.inf], None).to_dict(orient="records")
+        
+        csv_path = OUTPUT_DIR / f"{file_id}.csv"
+        final_df.to_csv(csv_path, index=False)
+
+        return {"preview": preview, "csv_url": f"/download/{file_id}.csv"}
 
     except Exception as e:
-        print(f"Server Error: {str(e)}")
-        # This prevents the 500 crash if AWS fails
-        return {"error": "Processing failed", "details": str(e)}
+        print(f"CRITICAL ERROR: {str(e)}")
+        return {"error": "Internal Server Error", "message": str(e)}
 
-    # 3. Combine and CRITICAL FIX for JSON Serialization
-    final_df = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame(columns=['Date', 'Description', 'Paid Out', 'Paid In', 'Balance'])
-    
-    # Replace all NaN/Inf with None so JSON doesn't crash
-    clean_preview = final_df.head(20).replace([np.nan, np.inf, -np.inf], None).to_dict(orient="records")
-    
-    csv_path = OUTPUT_DIR / f"{file_id}.csv"
-    final_df.to_csv(csv_path, index=False)
-
-    return {
-        "preview": clean_preview,
-        "csv_url": f"/download/{csv_path.name}"
-    }
-
-@app.get("/download/{name}")
-async def download(name: str):
-    return FileResponse(OUTPUT_DIR / name, media_type="text/csv", filename="docneat-export.csv")
-
-@app.get("/")
-def root(): return {"status": "DocNeat Logic V12 - Multi-Line & Serialization Fixed"}
+@app.get("/download/{file_id}.csv")
+async def download(file_id: str):
+    return FileResponse(OUTPUT_DIR / f"{file_id}.csv", media_type="text/csv", filename="statement_export.csv")
