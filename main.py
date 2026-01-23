@@ -33,12 +33,10 @@ textract = boto3.client('textract',
 )
 
 BUCKET_NAME = os.getenv('AWS_S3_BUCKET')
-
-# Strict Date Regex: Matches "16 Sep 25"
 DATE_REGEX = r'\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s\d{2}'
 
 def is_clean_num(val):
-    """Checks if a string is EXCLUSIVELY a number (no words allowed)."""
+    if not val: return False
     s = str(val).replace('£','').replace('$','').replace(',','').strip()
     return bool(re.fullmatch(r'-?\d+\.\d{2}', s))
 
@@ -47,84 +45,69 @@ def to_num(val):
     return s if re.fullmatch(r'-?\d+\.\d{2}', s) else ""
 
 def parse_hsbc_rows(df, sticky_date):
-    txns = []
+    if df.empty: return [], sticky_date
+    
+    # --- Structural Analysis of this specific table ---
     num_cols = len(df.columns)
+    col_stats = {i: {'nums': 0, 'dates': 0} for i in range(num_cols)}
     
-    # Identify which columns are generally used for amounts (usually the last 3)
-    # We don't hardcode them, but we use them as a guide.
+    for _, row in df.iterrows():
+        for i, v in enumerate(row.values):
+            s = str(v).strip()
+            if re.search(DATE_REGEX, s): col_stats[i]['dates'] += 1
+            if is_clean_num(s): col_stats[i]['nums'] += 1
+
+    # Date is the column with the most date matches (usually 0)
+    d_col = max(col_stats, key=lambda k: col_stats[k]['dates']) if any(c['dates'] > 0 for c in col_stats.values()) else 0
     
+    # Financial columns are usually the last three that ever contain numbers
+    num_indices = [i for i, c in col_stats.items() if c['nums'] > 0]
+    # We anchor from the right: Bal, In, Out
+    bal_col = num_indices[-1] if len(num_indices) >= 1 else -1
+    in_col = num_indices[-2] if len(num_indices) >= 2 else -1
+    out_col = num_indices[-3] if len(num_indices) >= 3 else -1
+
+    # --- Row Processing ---
+    txns = []
+    blacklist = ["opening balance", "closing balance", "payments in", "payments out", "payment type and details"]
+
     for _, row in df.iterrows():
         vals = [str(v).strip() for v in row.values]
         row_str = " ".join(vals).lower()
         
-        # 1. Skip Headers and Summary Noise
-        if any(x in row_str for x in ["opening balance", "closing balance", "payments in", "payments out", "payment type"]):
-            if not "forward" in row_str: continue
+        if any(x in row_str for x in blacklist) and not "forward" in row_str:
+            continue
 
-        # 2. Extract Date
-        d_match = re.search(DATE_REGEX, vals[0] + " " + (vals[1] if num_cols > 1 else ""))
+        # Date handling
+        d_match = re.search(DATE_REGEX, vals[d_col]) if d_col < len(vals) else None
+        if not d_match and d_col + 1 < len(vals): # Fallback check next column
+             d_match = re.search(DATE_REGEX, vals[d_col+1])
         if d_match: sticky_date = d_match.group()
 
-        # 3. Extract Amounts and Balance
-        # Logic: Balance is always the last clean number. 
-        # Paid In is the one before it. Paid Out is the one before that.
-        amounts = []
-        for i, v in enumerate(vals):
-            if is_clean_num(v):
-                amounts.append({'idx': i, 'val': to_num(v)})
+        # Amount extraction using the structural map
+        p_out = to_num(vals[out_col]) if out_col != -1 else ""
+        p_in = to_num(vals[in_col]) if in_col != -1 else ""
+        p_bal = to_num(vals[bal_col]) if bal_col != -1 else ""
         
-        p_out, p_in, p_bal = "", "", ""
-        used_indices = []
+        # Determine used indices to extract description
+        used_indices = {d_col}
+        if p_out: used_indices.add(out_col)
+        if p_in: used_indices.add(in_col)
+        if p_bal: used_indices.add(bal_col)
 
+        # Build description from everything else
+        desc = " ".join([v for i, v in enumerate(vals) if i not in used_indices and v and not re.search(DATE_REGEX, v)]).strip()
+
+        # Special Case: Balance Forward
         if "forward" in row_str:
-            # For Forward rows, we only care about the balance (usually the last number)
-            if amounts:
-                p_bal = amounts[-1]['val']
-                used_indices = [amounts[-1]['idx']]
-        else:
-            # Standard row: Identify Out/In/Bal based on right-to-left order
-            if len(amounts) >= 1:
-                p_bal = amounts[-1]['val']
-                used_indices.append(amounts[-1]['idx'])
-            if len(amounts) >= 2:
-                # If there are two more numbers, it's Out and In. 
-                # But HSBC rows usually only have ONE transaction amount + Balance.
-                # If we find 3 numbers total: Out, In, Balance.
-                if len(amounts) == 3:
-                    p_in = amounts[-2]['val']
-                    p_out = amounts[-3]['val']
-                    used_indices.extend([amounts[-2]['idx'], amounts[-3]['idx']])
-                else:
-                    # Only 2 numbers: Is it an amount and a balance?
-                    # If the column index is far to the right, it's likely Paid In.
-                    # Otherwise, Paid Out.
-                    if amounts[-2]['idx'] >= (num_cols - 2):
-                        p_in = amounts[-2]['val']
-                    else:
-                        p_out = amounts[-2]['val']
-                    used_indices.append(amounts[-2]['idx'])
-
-        # 4. Description: Everything that isn't a Date or a used Amount
-        desc_parts = []
-        for i, v in enumerate(vals):
-            # If the cell has text or was NOT used as a clean number, it's description
-            if i not in used_indices and v:
-                # Don't include the date string again in description
-                if not re.search(DATE_REGEX, v):
-                    desc_parts.append(v)
-        desc = " ".join(desc_parts).strip()
-
-        # 5. Save the row
-        if d_match or p_out or p_in or p_bal:
-            txns.append({
-                'Date': sticky_date,
-                'Description': desc,
-                'Paid Out': p_out,
-                'Paid In': p_in,
-                'Balance': p_bal
-            })
-        elif txns and desc and not any(k in desc.lower() for k in ["page", "details"]):
-            # Append orphaned text
+            # For these rows, we take the last number as balance, clear others
+            actual_bal = p_bal or p_in or p_out
+            txns.append({'Date': sticky_date, 'Description': desc, 'Paid Out': '', 'Paid In': '', 'Balance': actual_bal})
+        elif d_match or p_out or p_in or p_bal:
+            # Standard row
+            txns.append({'Date': sticky_date, 'Description': desc, 'Paid Out': p_out, 'Paid In': p_in, 'Balance': p_bal})
+        elif txns and desc and not any(k in desc.lower() for k in ["page", "details", "fscs"]):
+            # Continuation text
             txns[-1]['Description'] = (txns[-1]['Description'] + " " + desc).strip()
 
     return txns, sticky_date
@@ -204,4 +187,4 @@ async def get_status(job_id: str, file_key: str = Query(...)):
         return JSONResponse(status_code=500, content={"error": f"Logic Error: {str(e)}", "detail": traceback.format_exc()})
 
 @app.get("/")
-def health(): return {"status": "V41 - Visual Anchor Logic Active"}
+def health(): return {"status": "V42 - Gutter-Based Mapping Active"}
