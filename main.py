@@ -34,83 +34,97 @@ textract = boto3.client('textract',
 
 BUCKET_NAME = os.getenv('AWS_S3_BUCKET')
 
-# Strict Date Regex: Matches "16 Sep 25" but NOT "22 EUR 19"
+# Strict Date Regex: Matches "16 Sep 25"
 DATE_REGEX = r'\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s\d{2}'
 
-def get_clean_amt(val):
-    if not val: return ""
+def is_clean_num(val):
+    """Checks if a string is EXCLUSIVELY a number (no words allowed)."""
     s = str(val).replace('£','').replace('$','').replace(',','').strip()
-    match = re.search(r'-?\d+\.\d{2}', s)
-    return match.group(0) if match else ""
+    return bool(re.fullmatch(r'-?\d+\.\d{2}', s))
 
-def parse_hsbc_logic(df, sticky_date):
-    if df.empty: return [], sticky_date
-    
-    # 1. High-Certainty Column Mapping
-    # Date is always column 0 or 1. Amounts are always in the last 3 columns.
-    num_cols = len(df.columns)
-    col_map = {'date': -1, 'out': -1, 'in': -1, 'bal': -1}
-    
-    # Scan first 2 columns for date
-    for i in range(min(2, num_cols)):
-        if df.iloc[:, i].astype(str).str.contains(DATE_REGEX, regex=True).any():
-            col_map['date'] = i
-            break
-            
-    # Map from the right: Balance is usually last, then In, then Out
-    # We look for numeric patterns in the last 4 columns
-    potential_nums = []
-    for i in range(max(0, num_cols-4), num_cols):
-        if df.iloc[:, i].astype(str).apply(get_clean_amt).replace('', np.nan).notna().any():
-            potential_nums.append(i)
-    
-    if len(potential_nums) >= 1: col_map['bal'] = potential_nums[-1]
-    if len(potential_nums) >= 2: col_map['in'] = potential_nums[-2]
-    if len(potential_nums) >= 3: col_map['out'] = potential_nums[-3]
+def to_num(val):
+    s = str(val).replace('£','').replace('$','').replace(',','').strip()
+    return s if re.fullmatch(r'-?\d+\.\d{2}', s) else ""
 
+def parse_hsbc_rows(df, sticky_date):
     txns = []
-    blacklist = ["opening balance", "closing balance", "payments in", "payments out", 
-                 "payment type", "credit interest", "debit interest", "fscs"]
-
+    num_cols = len(df.columns)
+    
+    # Identify which columns are generally used for amounts (usually the last 3)
+    # We don't hardcode them, but we use them as a guide.
+    
     for _, row in df.iterrows():
-        vals = [str(v).strip() if v is not None and str(v).lower() != 'nan' else "" for v in row.values]
+        vals = [str(v).strip() for v in row.values]
         row_str = " ".join(vals).lower()
         
-        # Immediate removal of summary and footer noise
-        if any(item in row_str for item in blacklist) and not "forward" in row_str:
-            continue
-            
-        # Date Logic
-        d_idx = col_map['date']
-        d_val = vals[d_idx] if d_idx != -1 else ""
-        d_match = re.search(DATE_REGEX, d_val)
+        # 1. Skip Headers and Summary Noise
+        if any(x in row_str for x in ["opening balance", "closing balance", "payments in", "payments out", "payment type"]):
+            if not "forward" in row_str: continue
+
+        # 2. Extract Date
+        d_match = re.search(DATE_REGEX, vals[0] + " " + (vals[1] if num_cols > 1 else ""))
         if d_match: sticky_date = d_match.group()
+
+        # 3. Extract Amounts and Balance
+        # Logic: Balance is always the last clean number. 
+        # Paid In is the one before it. Paid Out is the one before that.
+        amounts = []
+        for i, v in enumerate(vals):
+            if is_clean_num(v):
+                amounts.append({'idx': i, 'val': to_num(v)})
         
-        # Amount Logic
-        p_out = get_clean_amt(vals[col_map['out']]) if col_map['out'] != -1 else ""
-        p_in = get_clean_amt(vals[col_map['in']]) if col_map['in'] != -1 else ""
-        p_bal = get_clean_amt(vals[col_map['bal']]) if col_map['bal'] != -1 else ""
-        
-        # Description: Everything that isn't the date or an amount
-        money_indices = [col_map['out'], col_map['in'], col_map['bal']]
+        p_out, p_in, p_bal = "", "", ""
+        used_indices = []
+
+        if "forward" in row_str:
+            # For Forward rows, we only care about the balance (usually the last number)
+            if amounts:
+                p_bal = amounts[-1]['val']
+                used_indices = [amounts[-1]['idx']]
+        else:
+            # Standard row: Identify Out/In/Bal based on right-to-left order
+            if len(amounts) >= 1:
+                p_bal = amounts[-1]['val']
+                used_indices.append(amounts[-1]['idx'])
+            if len(amounts) >= 2:
+                # If there are two more numbers, it's Out and In. 
+                # But HSBC rows usually only have ONE transaction amount + Balance.
+                # If we find 3 numbers total: Out, In, Balance.
+                if len(amounts) == 3:
+                    p_in = amounts[-2]['val']
+                    p_out = amounts[-3]['val']
+                    used_indices.extend([amounts[-2]['idx'], amounts[-3]['idx']])
+                else:
+                    # Only 2 numbers: Is it an amount and a balance?
+                    # If the column index is far to the right, it's likely Paid In.
+                    # Otherwise, Paid Out.
+                    if amounts[-2]['idx'] >= (num_cols - 2):
+                        p_in = amounts[-2]['val']
+                    else:
+                        p_out = amounts[-2]['val']
+                    used_indices.append(amounts[-2]['idx'])
+
+        # 4. Description: Everything that isn't a Date or a used Amount
         desc_parts = []
         for i, v in enumerate(vals):
-            if i != col_map['date'] and i not in money_indices and v:
-                desc_parts.append(v)
-        desc = " ".join(desc_parts)
+            # If the cell has text or was NOT used as a clean number, it's description
+            if i not in used_indices and v:
+                # Don't include the date string again in description
+                if not re.search(DATE_REGEX, v):
+                    desc_parts.append(v)
+        desc = " ".join(desc_parts).strip()
 
-        # New row trigger: Date found OR any Money found
-        has_money = p_out or p_in or p_bal
-        if d_match or has_money:
-            # Handle Summary Rows
-            if "forward" in desc.lower():
-                # For Brought/Carried Forward, we only want the Balance column
-                final_bal = p_bal or p_in or p_out
-                txns.append({'Date': sticky_date, 'Description': desc, 'Paid Out': '', 'Paid In': '', 'Balance': final_bal})
-            else:
-                txns.append({'Date': sticky_date, 'Description': desc, 'Paid Out': p_out, 'Paid In': p_in, 'Balance': p_bal})
-        elif txns and desc:
-            # Append multi-line text to previous description
+        # 5. Save the row
+        if d_match or p_out or p_in or p_bal:
+            txns.append({
+                'Date': sticky_date,
+                'Description': desc,
+                'Paid Out': p_out,
+                'Paid In': p_in,
+                'Balance': p_bal
+            })
+        elif txns and desc and not any(k in desc.lower() for k in ["page", "details"]):
+            # Append orphaned text
             txns[-1]['Description'] = (txns[-1]['Description'] + " " + desc).strip()
 
     return txns, sticky_date
@@ -168,7 +182,7 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                     
                     if grid:
                         df_table = pd.DataFrame.from_dict(grid, orient='index').sort_index(axis=1)
-                        table_txns, sticky_date = parse_hsbc_logic(df_table, sticky_date)
+                        table_txns, sticky_date = parse_hsbc_rows(df_table, sticky_date)
                         final_data.extend(table_txns)
 
             try: s3.delete_object(Bucket=BUCKET_NAME, Key=file_key)
@@ -178,7 +192,6 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                 return {"status": "COMPLETED", "preview": [], "csv_content": ""}
             
             final_df = pd.DataFrame(final_data).drop_duplicates()
-            # Absolute cleanup
             final_df = final_df.astype(str).replace(['nan', 'None', 'NaN', '0.00'], '')
             
             return {
@@ -191,4 +204,4 @@ async def get_status(job_id: str, file_key: str = Query(...)):
         return JSONResponse(status_code=500, content={"error": f"Logic Error: {str(e)}", "detail": traceback.format_exc()})
 
 @app.get("/")
-def health(): return {"status": "V40 - Fixed Boundary Constraints Active"}
+def health(): return {"status": "V41 - Visual Anchor Logic Active"}
