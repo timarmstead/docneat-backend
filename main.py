@@ -37,6 +37,7 @@ BUCKET_NAME = os.getenv('AWS_S3_BUCKET')
 def parse_hsbc_logic(df):
     if df.empty: return pd.DataFrame()
     
+    # 1. Identify key columns
     date_freq = {}
     num_freq = {}
     for _, row in df.iterrows():
@@ -57,40 +58,55 @@ def parse_hsbc_logic(df):
     if len(valid_nums) >= 3: col_map['out'] = valid_nums[2]
 
     first_amt_col = min([c for c in [col_map['out'], col_map['in'], col_map['bal']] if c != -1] or [99])
+    
+    # Summary & Header filtering
+    blacklist = ["opening balance", "closing balance", "payments in", "payments out", 
+                 "payment type and details", "paid out", "paid in", "balance"]
+    
     txns = []
-    current_date = None
+    sticky_date = ""
     
     for _, row in df.iterrows():
         vals = [str(v).strip() if v is not None and str(v).lower() != 'nan' else "" for v in row.values]
-        if not any(vals): continue
+        row_text = " ".join(vals).lower()
         
+        # Skip if row is a header or summary row
+        if any(item in row_text for item in blacklist) and not "brought forward" in row_text and not "carried forward" in row_text:
+            continue
+            
         def get_safe(idx):
             return vals[idx] if (idx != -1 and idx < len(vals)) else ""
 
+        # Date Detection
         d_val = get_safe(col_map['date'])
         d_match = re.search(r'\d{1,2}\s[A-Za-z]{3}\s\d{2}', d_val)
+        if d_match:
+            sticky_date = d_match.group()
         
         row_out = get_safe(col_map['out']).replace(',','').replace('£','').strip()
         row_in = get_safe(col_map['in']).replace(',','').replace('£','').strip()
         row_bal = get_safe(col_map['bal']).replace(',','').replace('£','').strip()
         
-        # Check if row has numeric data for Paid In/Out
+        # Trigger new row if it has a Date or an Amount
         has_amt = any(re.match(r'^-?\d*\.?\d+$', x) for x in [row_out, row_in] if x)
+        has_bal_only = row_bal and not has_amt and not d_match
 
-        if d_match or has_amt or row_bal:
-            if d_match: current_date = d_match.group()
+        if d_match or has_amt or has_bal_only:
             desc_start = col_map['date'] + 1 if col_map['date'] != -1 else 0
             description = " ".join([v for v in vals[desc_start:min(first_amt_col, len(vals))] if v])
             
-            # Use empty strings instead of zeros for cleaner accounting
+            # Skip if description is just headers
+            if description.lower() in blacklist: continue
+
             txns.append({
-                'Date': current_date,
+                'Date': sticky_date,
                 'Description': description,
-                'Paid Out': row_out if row_out else "",
-                'Paid In': row_in if row_in else "",
+                'Paid Out': row_out if row_out and row_out != "0.00" else "",
+                'Paid In': row_in if row_in and row_in != "0.00" else "",
                 'Balance': row_bal
             })
-        elif txns:
+        elif txns and sticky_date:
+            # Multi-line description continuation
             extra = " ".join([v for i, v in enumerate(vals) if v and i < first_amt_col])
             if extra:
                 txns[-1]['Description'] = (txns[-1]['Description'] + " " + extra).strip()
@@ -159,10 +175,7 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                 return {"status": "COMPLETED", "preview": [], "csv_content": ""}
             
             final_df = pd.concat(all_dfs, ignore_index=True).drop_duplicates()
-            
-            # Ensure no NaNs or Infs leak into the JSON
-            final_df = final_df.fillna("").replace([np.inf, -np.inf], "")
-            
+            final_df = final_df.astype(str).replace(['nan', 'None', 'NaN', 'inf', '-inf'], '')
             preview_data = final_df.head(100).to_dict(orient="records")
 
             return {
@@ -172,8 +185,7 @@ async def get_status(job_id: str, file_key: str = Query(...)):
             }
             
     except Exception as e:
-        error_detail = traceback.format_exc()
-        return JSONResponse(status_code=500, content={"error": f"Logic Error: {str(e)}", "detail": error_detail})
+        return JSONResponse(status_code=500, content={"error": f"Logic Error: {str(e)}", "detail": traceback.format_exc()})
 
 @app.get("/")
-def health(): return {"status": "V33 - Clean Space Formatting"}
+def health(): return {"status": "V35 - Summary Filtering & Sticky Dates"}
