@@ -34,19 +34,14 @@ textract = boto3.client('textract',
 
 BUCKET_NAME = os.getenv('AWS_S3_BUCKET')
 
-def process_all_rows(all_rows):
-    """
-    Processes a flat list of rows from the entire document.
-    Ensures dates propagate across page/table boundaries.
-    """
-    if not all_rows: return pd.DataFrame()
-
-    # 1. Column detection based on global data patterns
-    # We find the most likely indices for Date, Out, In, and Balance
+def parse_hsbc_logic(df):
+    if df.empty: return pd.DataFrame()
+    
+    # 1. Identify key columns
     date_freq = {}
     num_freq = {}
-    for row in all_rows:
-        for i, v in enumerate(row):
+    for _, row in df.iterrows():
+        for i, v in enumerate(row.values):
             s = str(v).strip()
             if re.search(r'\d{1,2}\s[A-Za-z]{3}\s\d{2}', s):
                 date_freq[i] = date_freq.get(i, 0) + 1
@@ -56,33 +51,33 @@ def process_all_rows(all_rows):
                 
     col_map = {'date': -1, 'out': -1, 'in': -1, 'bal': -1}
     if date_freq: col_map['date'] = max(date_freq, key=date_freq.get)
-    # Filter for numeric columns that appear consistently
-    valid_nums = sorted([idx for idx, count in num_freq.items() if count > (len(all_rows) * 0.05)], reverse=True)
+    valid_nums = sorted([idx for idx, count in num_freq.items() if count > 0], reverse=True)
     
     if len(valid_nums) >= 1: col_map['bal'] = valid_nums[0]
     if len(valid_nums) >= 2: col_map['in'] = valid_nums[1]
     if len(valid_nums) >= 3: col_map['out'] = valid_nums[2]
 
     first_amt_col = min([c for c in [col_map['out'], col_map['in'], col_map['bal']] if c != -1] or [99])
-    blacklist = ["opening balance", "closing balance", "payments in", "payments out", "payment type and details"]
+    
+    # Summary & Header filtering
+    blacklist = ["opening balance", "closing balance", "payments in", "payments out", 
+                 "payment type and details", "paid out", "paid in", "balance"]
     
     txns = []
     sticky_date = ""
     
-    for row in all_rows:
-        vals = [str(v).strip() if v is not None and str(v).lower() != 'nan' else "" for v in row]
+    for _, row in df.iterrows():
+        vals = [str(v).strip() if v is not None and str(v).lower() != 'nan' else "" for v in row.values]
         row_text = " ".join(vals).lower()
         
-        # Skip summary headers, but keep 'Brought Forward' rows
-        is_summary = any(item in row_text for item in blacklist)
-        is_forward = "brought forward" in row_text or "carried forward" in row_text
-        if is_summary and not is_forward:
+        # Skip if row is a header or summary row
+        if any(item in row_text for item in blacklist) and not "brought forward" in row_text and not "carried forward" in row_text:
             continue
             
         def get_safe(idx):
             return vals[idx] if (idx != -1 and idx < len(vals)) else ""
 
-        # Update date if found
+        # Date Detection
         d_val = get_safe(col_map['date'])
         d_match = re.search(r'\d{1,2}\s[A-Za-z]{3}\s\d{2}', d_val)
         if d_match:
@@ -92,13 +87,17 @@ def process_all_rows(all_rows):
         row_in = get_safe(col_map['in']).replace(',','').replace('£','').strip()
         row_bal = get_safe(col_map['bal']).replace(',','').replace('£','').strip()
         
+        # Trigger new row if it has a Date or an Amount
         has_amt = any(re.match(r'^-?\d*\.?\d+$', x) for x in [row_out, row_in] if x)
-        # Force a new row if we have an amount, a date, or it's a balance forward row
-        if d_match or has_amt or is_forward:
+        has_bal_only = row_bal and not has_amt and not d_match
+
+        if d_match or has_amt or has_bal_only:
             desc_start = col_map['date'] + 1 if col_map['date'] != -1 else 0
             description = " ".join([v for v in vals[desc_start:min(first_amt_col, len(vals))] if v])
             
-            # Use sticky date to fill gaps at page turns
+            # Skip if description is just headers
+            if description.lower() in blacklist: continue
+
             txns.append({
                 'Date': sticky_date,
                 'Description': description,
@@ -107,7 +106,7 @@ def process_all_rows(all_rows):
                 'Balance': row_bal
             })
         elif txns and sticky_date:
-            # Check if this is a secondary description line (no date, no amount)
+            # Multi-line description continuation
             extra = " ".join([v for i, v in enumerate(vals) if v and i < first_amt_col])
             if extra:
                 txns[-1]['Description'] = (txns[-1]['Description'] + " " + extra).strip()
@@ -145,9 +144,8 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                 next_token = next_page.get('NextToken')
             
             bmap = {b['Id']: b for b in all_blocks}
+            all_dfs = []
             
-            # NEW: Collect ALL rows from ALL tables into a master list first
-            document_rows = []
             for block in all_blocks:
                 if block['BlockType'] == 'TABLE':
                     grid = {}
@@ -166,20 +164,17 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                             grid.setdefault(r, {})[c] = text.strip()
                     
                     if grid:
-                        # Convert this specific table to a sorted list of lists
-                        sorted_rows = sorted(grid.keys())
-                        for r_idx in sorted_rows:
-                            row_data = [grid[r_idx].get(c_idx, "") for c_idx in sorted(grid[r_idx].keys())]
-                            document_rows.append(row_data)
+                        df_raw = pd.DataFrame.from_dict(grid, orient='index').sort_index(axis=1)
+                        processed = parse_hsbc_logic(df_raw)
+                        if not processed.empty: all_dfs.append(processed)
 
             try: s3.delete_object(Bucket=BUCKET_NAME, Key=file_key)
             except: pass
 
-            if not document_rows:
+            if not all_dfs:
                 return {"status": "COMPLETED", "preview": [], "csv_content": ""}
             
-            # Process the combined list of rows in one pass
-            final_df = process_all_rows(document_rows).drop_duplicates()
+            final_df = pd.concat(all_dfs, ignore_index=True).drop_duplicates()
             final_df = final_df.astype(str).replace(['nan', 'None', 'NaN', 'inf', '-inf'], '')
             preview_data = final_df.head(100).to_dict(orient="records")
 
@@ -193,4 +188,4 @@ async def get_status(job_id: str, file_key: str = Query(...)):
         return JSONResponse(status_code=500, content={"error": f"Logic Error: {str(e)}", "detail": traceback.format_exc()})
 
 @app.get("/")
-def health(): return {"status": "V36 - Global Row Consolidation"}
+def health(): return {"status": "V35 - Summary Filtering & Sticky Dates"}
