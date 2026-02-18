@@ -44,49 +44,70 @@ def to_num(val):
     s = str(val).replace('£','').replace('$','').replace(',','').strip()
     return s if re.fullmatch(r'-?\d+\.\d{2}', s) else ""
 
-def parse_hsbc_rows(df, sticky_date):
-    if df.empty: return [], sticky_date
-    
+def find_columns_semantically(df):
+    """
+    Scans the first 3 rows of a table to map columns based on keywords.
+    """
+    col_map = {'date': -1, 'out': -1, 'in': -1, 'bal': -1}
+    keywords = {
+        'date': ["date", "trans", "value", "when"],
+        'out': ["paid out", "debit", "withdrawals", "spent", "amount out", "out"],
+        'in': ["paid in", "credit", "deposits", "received", "amount in", "in"],
+        'bal': ["balance", "running balance", "total", "bal"]
+    }
+
+    # Search first 3 rows for keywords
+    for r_idx in range(min(3, len(df))):
+        row = [str(c).lower().strip() for c in df.iloc[r_idx].values]
+        for c_idx, cell_text in enumerate(row):
+            for key, key_list in keywords.items():
+                if any(k in cell_text for k in key_list) and col_map[key] == -1:
+                    col_map[key] = c_idx
+
+    # --- FALLBACK: If semantic scan fails, use Visual Anchors (V43 logic) ---
     num_cols = len(df.columns)
     col_stats = {i: {'nums': 0, 'dates': 0} for i in range(num_cols)}
-    
     for _, row in df.iterrows():
         for i, v in enumerate(row.values):
             s = str(v).strip()
             if re.search(DATE_REGEX, s): col_stats[i]['dates'] += 1
             if is_clean_num(s): col_stats[i]['nums'] += 1
 
-    d_col = max(col_stats, key=lambda k: col_stats[k]['dates']) if any(c['dates'] > 0 for c in col_stats.values()) else 0
-    num_indices = [i for i, c in col_stats.items() if c['nums'] > 0]
+    if col_map['date'] == -1:
+        col_map['date'] = max(col_stats, key=lambda k: col_stats[k]['dates']) if any(c['dates'] > 0 for c in col_stats.values()) else 0
     
-    bal_col = num_indices[-1] if len(num_indices) >= 1 else -1
-    in_col = num_indices[-2] if len(num_indices) >= 2 else -1
-    out_col = num_indices[-3] if len(num_indices) >= 3 else -1
+    num_indices = [i for i, c in col_stats.items() if c['nums'] > 0]
+    if col_map['bal'] == -1 and len(num_indices) >= 1: col_map['bal'] = num_indices[-1]
+    if col_map['in'] == -1 and len(num_indices) >= 2: col_map['in'] = num_indices[-2]
+    if col_map['out'] == -1 and len(num_indices) >= 3: col_map['out'] = num_indices[-3]
 
+    return col_map
+
+def parse_bank_agnostic(df, sticky_date):
+    if df.empty: return [], sticky_date
+    
+    col_map = find_columns_semantically(df)
     txns = []
-    blacklist = ["opening balance", "closing balance", "payments in", "payments out", "payment type and details", "fscs"]
+    blacklist = ["opening balance", "closing balance", "payments in", "payments out", "payment type", "fscs"]
 
     for _, row in df.iterrows():
         vals = [str(v).strip() for v in row.values]
         row_str = " ".join(vals).lower()
         
+        # Skip labels and summary rows (unless they have 'forward')
         if any(x in row_str for x in blacklist) and not "forward" in row_str:
             continue
 
-        d_match = re.search(DATE_REGEX, vals[d_col]) if d_col < len(vals) else None
-        if not d_match and d_col + 1 < len(vals):
-             d_match = re.search(DATE_REGEX, vals[d_col+1])
+        # Extract Date
+        d_match = re.search(DATE_REGEX, vals[col_map['date']]) if col_map['date'] != -1 else None
         if d_match: sticky_date = d_match.group()
 
-        p_out = to_num(vals[out_col]) if out_col != -1 else ""
-        p_in = to_num(vals[in_col]) if in_col != -1 else ""
-        p_bal = to_num(vals[bal_col]) if bal_col != -1 else ""
+        # Extract Amounts
+        p_out = to_num(vals[col_map['out']]) if col_map['out'] != -1 else ""
+        p_in = to_num(vals[col_map['in']]) if col_map['in'] != -1 else ""
+        p_bal = to_num(vals[col_map['bal']]) if col_map['bal'] != -1 else ""
         
-        used_indices = {d_col}
-        if p_out: used_indices.add(out_col)
-        if p_in: used_indices.add(in_col)
-        if p_bal: used_indices.add(bal_col)
-
+        used_indices = {col_map['date'], col_map['out'], col_map['in'], col_map['bal']}
         desc = " ".join([v for i, v in enumerate(vals) if i not in used_indices and v and not re.search(DATE_REGEX, v)]).strip()
 
         if "forward" in row_str:
@@ -152,7 +173,7 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                     
                     if grid:
                         df_table = pd.DataFrame.from_dict(grid, orient='index').sort_index(axis=1)
-                        table_txns, sticky_date = parse_hsbc_rows(df_table, sticky_date)
+                        table_txns, sticky_date = parse_bank_agnostic(df_table, sticky_date)
                         final_data.extend(table_txns)
 
             try: s3.delete_object(Bucket=BUCKET_NAME, Key=file_key)
@@ -161,7 +182,7 @@ async def get_status(job_id: str, file_key: str = Query(...)):
             if not final_data:
                 return {"status": "COMPLETED", "preview": [], "csv_content": ""}
             
-            # THE FIX: Explicitly set and order columns to ensure 'Date' is at [0,0]
+            # Use explicit ordering for the final export
             columns = ['Date', 'Description', 'Paid Out', 'Paid In', 'Balance']
             final_df = pd.DataFrame(final_data, columns=columns).drop_duplicates()
             final_df = final_df.astype(str).replace(['nan', 'None', 'NaN', '0.00'], '')
@@ -176,4 +197,4 @@ async def get_status(job_id: str, file_key: str = Query(...)):
         return JSONResponse(status_code=500, content={"error": f"Logic Error: {str(e)}", "detail": traceback.format_exc()})
 
 @app.get("/")
-def health(): return {"status": "V43 - Final Header Alignment"}
+def health(): return {"status": "V44 - Semantic Pre-Processor Active"}
