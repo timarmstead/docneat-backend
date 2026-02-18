@@ -37,18 +37,18 @@ DATE_REGEX = r'\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:\s
 
 def is_clean_num(val):
     if not val: return False
-    s = str(val).replace('£','').replace('$','').replace(',','').strip()
+    s = str(val).replace('£','').replace('$','').replace(',','').replace('€','').strip()
     return bool(re.fullmatch(r'-?\d+\.\d{2}', s))
 
 def to_num(val):
-    s = str(val).replace('£','').replace('$','').replace(',','').strip()
+    s = str(val).replace('£','').replace('$','').replace(',','').replace('€','').strip()
     return s if re.fullmatch(r'-?\d+\.\d{2}', s) else ""
 
 def find_columns_semantically(df):
     col_map = {'date': -1, 'out': -1, 'in': -1, 'bal': -1}
     keywords = {
         'date': ["date", "trans", "value", "when"],
-        'out': ["paid out", "debit", "withdrawals", "spent", "money out", "out"],
+        'out': ["paid out", "debit", "withdrawals", "spent", "money out", "out", "amount of debt"],
         'in': ["paid in", "credit", "deposits", "received", "money in", "in"],
         'bal': ["balance", "running balance", "total", "bal"]
     }
@@ -77,8 +77,10 @@ def parse_bank_agnostic(df, sticky_date, global_year):
     if df.empty: return [], sticky_date
     text_content = df.astype(str).values.flatten()
     date_matches = [t for t in text_content if re.search(DATE_REGEX, t)]
-    if len(date_matches) < 2 and "balance" not in " ".join(text_content).lower():
+    # Stronger check: If no dates found in the table, it's likely not a transaction table
+    if len(date_matches) == 0:
         return [], sticky_date
+
     col_map = find_columns_semantically(df)
     txns = []
     for _, row in df.iterrows():
@@ -135,18 +137,6 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                 all_blocks.extend(next_page.get('Blocks', []))
                 next_token = next_page.get('NextToken')
             
-            # --- ERROR SHIELD: VALIDATION ---
-            has_tables = any(b['BlockType'] == 'TABLE' for b in all_blocks)
-            full_text = " ".join([b.get('Text', '') for b in all_blocks if b['BlockType'] == 'LINE']).lower()
-            banking_keywords = ["statement", "account", "balance", "date", "transaction", "debit", "credit", "money out", "money in"]
-            keyword_count = sum(1 for word in banking_keywords if word in full_text)
-
-            if not has_tables or keyword_count < 2:
-                return JSONResponse(status_code=422, content={
-                    "status": "ERROR", 
-                    "message": "DocNeat couldn't find a bank statement layout in this file. Please ensure you are uploading a clear, standard PDF statement."
-                })
-            
             bmap = {b['Id']: b for b in all_blocks}
             global_year = ""
             for block in all_blocks:
@@ -156,6 +146,7 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                     if m: 
                         global_year = m.group(1)
                         break
+            
             final_data = []
             sticky_date = ""
             for block in all_blocks:
@@ -178,13 +169,22 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                         df_table = pd.DataFrame.from_dict(grid, orient='index').sort_index(axis=1)
                         table_txns, sticky_date = parse_bank_agnostic(df_table, sticky_date, global_year)
                         final_data.extend(table_txns)
+            
+            # --- FINAL VALIDATION SHIELD ---
+            # If after all parsing we have NO actual transactions, it's not a statement.
+            if not final_data:
+                return JSONResponse(status_code=422, content={
+                    "status": "ERROR", 
+                    "message": "DocNeat couldn't identify any transactions in this document. Please ensure it is a standard bank statement with dates and amounts."
+                })
+
             try: s3.delete_object(Bucket=BUCKET_NAME, Key=file_key)
             except: pass
-            if not final_data:
-                return {"status": "COMPLETED", "preview": [], "csv_content": ""}
+
             columns = ['Date', 'Description', 'Paid Out', 'Paid In', 'Balance']
             final_df = pd.DataFrame(final_data, columns=columns).drop_duplicates()
             final_df = final_df.astype(str).replace(['nan', 'None', 'NaN', '0.00'], '')
+            
             return {
                 "status": "COMPLETED",
                 "preview": final_df.head(100).to_dict(orient="records"),
@@ -192,3 +192,6 @@ async def get_status(job_id: str, file_key: str = Query(...)):
             }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Logic Error: {str(e)}", "detail": traceback.format_exc()})
+
+@app.get("/")
+def health(): return {"status": "V48 - Final Transaction Validation Active"}
