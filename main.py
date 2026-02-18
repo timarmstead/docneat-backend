@@ -33,8 +33,6 @@ textract = boto3.client('textract',
 )
 
 BUCKET_NAME = os.getenv('AWS_S3_BUCKET')
-
-# IMPROVED REGEX: Matches "16 Sep 25" OR "05 Oct"
 DATE_REGEX = r'\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:\s\d{2,4})?'
 
 def is_clean_num(val):
@@ -55,14 +53,15 @@ def find_columns_semantically(df):
         'bal': ["balance", "running balance", "total", "bal"]
     }
 
-    for r_idx in range(min(3, len(df))):
+    # Semantic Scan
+    for r_idx in range(min(5, len(df))):
         row = [str(c).lower().strip() for c in df.iloc[r_idx].values]
         for c_idx, cell_text in enumerate(row):
             for key, key_list in keywords.items():
-                if any(k in cell_text for k in key_list) and col_map[key] == -1:
+                if any(k == cell_text or cell_text.startswith(k) for k in key_list) and col_map[key] == -1:
                     col_map[key] = c_idx
 
-    # Fallback to visual anchors
+    # Visual Fallback
     num_cols = len(df.columns)
     col_stats = {i: {'nums': 0, 'dates': 0} for i in range(num_cols)}
     for _, row in df.iterrows():
@@ -84,21 +83,28 @@ def find_columns_semantically(df):
 def parse_bank_agnostic(df, sticky_date, global_year):
     if df.empty: return [], sticky_date
     
+    # Check if this table actually contains transactions
+    text_content = df.astype(str).values.flatten()
+    date_matches = [t for t in text_content if re.search(DATE_REGEX, t)]
+    if len(date_matches) < 2 and "balance" not in " ".join(text_content).lower():
+        return [], sticky_date
+
     col_map = find_columns_semantically(df)
     txns = []
-    blacklist = ["opening balance", "closing balance", "payments in", "payments out", "payment type", "fscs"]
-
+    
     for _, row in df.iterrows():
-        vals = [str(v).strip() for v in row.values]
+        vals = [str(v).strip() if v is not None and str(v).lower() != 'nan' else "" for v in row.values]
         row_str = " ".join(vals).lower()
         
-        if any(x in row_str for x in blacklist) and not "forward" in row_str:
-            continue
+        # Filter noise
+        if any(x in row_str for x in ["opening balance", "closing balance", "payment type", "fscs", "page"]):
+            if not "forward" in row_str and not "start balance" in row_str: continue
 
-        d_match = re.search(DATE_REGEX, vals[col_map['date']]) if col_map['date'] != -1 else None
+        # Date handling
+        d_val = vals[col_map['date']] if col_map['date'] != -1 else ""
+        d_match = re.search(DATE_REGEX, d_val)
         if d_match: 
             sticky_date = d_match.group()
-            # If no year in the date, add the global year found at top of statement
             if global_year and len(sticky_date.split()) < 3:
                 sticky_date = f"{sticky_date} {global_year}"
 
@@ -106,16 +112,21 @@ def parse_bank_agnostic(df, sticky_date, global_year):
         p_in = to_num(vals[col_map['in']]) if col_map['in'] != -1 else ""
         p_bal = to_num(vals[col_map['bal']]) if col_map['bal'] != -1 else ""
         
-        used_indices = {col_map['date'], col_map['out'], col_map['in'], col_map['bal']}
-        desc = " ".join([v for i, v in enumerate(vals) if i not in used_indices and v and not re.search(DATE_REGEX, v)]).strip()
+        # Description: Everything that isn't date or amount
+        money_indices = {col_map['out'], col_map['in'], col_map['bal']}
+        desc = " ".join([v for i, v in enumerate(vals) if i != col_map['date'] and i not in money_indices and v]).strip()
 
-        if "forward" in row_str or "start balance" in row_str:
-            actual_bal = p_bal or p_in or p_out
-            txns.append({'Date': sticky_date, 'Description': desc, 'Paid Out': '', 'Paid In': '', 'Balance': actual_bal})
-        elif d_match or p_out or p_in or p_bal:
+        # Save Logic
+        if "forward" in desc.lower() or "start balance" in desc.lower():
+            txns.append({'Date': sticky_date, 'Description': desc, 'Paid Out': '', 'Paid In': '', 'Balance': p_bal or p_in or p_out})
+        elif p_out or p_in:
             txns.append({'Date': sticky_date, 'Description': desc, 'Paid Out': p_out, 'Paid In': p_in, 'Balance': p_bal})
-        elif txns and desc and not any(k in desc.lower() for k in ["page", "details"]):
+        elif txns and desc:
+            # Multi-line description stitch
+            # If current row has no money, it's text for the PREVIOUS or NEXT transaction
+            # In Barclays, text often follows the amount
             txns[-1]['Description'] = (txns[-1]['Description'] + " " + desc).strip()
+            if p_bal and not txns[-1]['Balance']: txns[-1]['Balance'] = p_bal
 
     return txns, sticky_date
 
@@ -151,20 +162,20 @@ async def get_status(job_id: str, file_key: str = Query(...)):
             
             bmap = {b['Id']: b for b in all_blocks}
             
-            # Find the Year globally at the top of the statement
+            # Global Year Finder
             global_year = ""
             for block in all_blocks:
                 if block['BlockType'] == 'LINE':
-                    text = block.get('Text', '')
-                    # Look for 4-digit years like 2021 or 2024
-                    year_match = re.search(r'\b(20\d{2})\b', text)
-                    if year_match:
-                        global_year = year_match.group(1)
+                    txt = block.get('Text', '')
+                    m = re.search(r'\b(20\d{2})\b', txt)
+                    if m: 
+                        global_year = m.group(1)
                         break
 
             final_data = []
             sticky_date = ""
             
+            # Filter and Process Tables
             for block in all_blocks:
                 if block['BlockType'] == 'TABLE':
                     grid = {}
@@ -207,4 +218,4 @@ async def get_status(job_id: str, file_key: str = Query(...)):
         return JSONResponse(status_code=500, content={"error": f"Logic Error: {str(e)}", "detail": traceback.format_exc()})
 
 @app.get("/")
-def health(): return {"status": "V45 - Year Grafting & Flex Date Active"}
+def health(): return {"status": "V46 - High Density Filter Active"}
