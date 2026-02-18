@@ -52,16 +52,12 @@ def find_columns_semantically(df):
         'in': ["paid in", "credit", "deposits", "received", "money in", "in"],
         'bal': ["balance", "running balance", "total", "bal"]
     }
-
-    # Semantic Scan
     for r_idx in range(min(5, len(df))):
         row = [str(c).lower().strip() for c in df.iloc[r_idx].values]
         for c_idx, cell_text in enumerate(row):
             for key, key_list in keywords.items():
                 if any(k == cell_text or cell_text.startswith(k) for k in key_list) and col_map[key] == -1:
                     col_map[key] = c_idx
-
-    # Visual Fallback
     num_cols = len(df.columns)
     col_stats = {i: {'nums': 0, 'dates': 0} for i in range(num_cols)}
     for _, row in df.iterrows():
@@ -69,65 +65,45 @@ def find_columns_semantically(df):
             s = str(v).strip()
             if re.search(DATE_REGEX, s): col_stats[i]['dates'] += 1
             if is_clean_num(s): col_stats[i]['nums'] += 1
-
     if col_map['date'] == -1:
         col_map['date'] = max(col_stats, key=lambda k: col_stats[k]['dates']) if any(c['dates'] > 0 for c in col_stats.values()) else 0
-    
     num_indices = [i for i, c in col_stats.items() if c['nums'] > 0]
     if col_map['bal'] == -1 and len(num_indices) >= 1: col_map['bal'] = num_indices[-1]
     if col_map['in'] == -1 and len(num_indices) >= 2: col_map['in'] = num_indices[-2]
     if col_map['out'] == -1 and len(num_indices) >= 3: col_map['out'] = num_indices[-3]
-
     return col_map
 
 def parse_bank_agnostic(df, sticky_date, global_year):
     if df.empty: return [], sticky_date
-    
-    # Check if this table actually contains transactions
     text_content = df.astype(str).values.flatten()
     date_matches = [t for t in text_content if re.search(DATE_REGEX, t)]
     if len(date_matches) < 2 and "balance" not in " ".join(text_content).lower():
         return [], sticky_date
-
     col_map = find_columns_semantically(df)
     txns = []
-    
     for _, row in df.iterrows():
         vals = [str(v).strip() if v is not None and str(v).lower() != 'nan' else "" for v in row.values]
         row_str = " ".join(vals).lower()
-        
-        # Filter noise
         if any(x in row_str for x in ["opening balance", "closing balance", "payment type", "fscs", "page"]):
             if not "forward" in row_str and not "start balance" in row_str: continue
-
-        # Date handling
         d_val = vals[col_map['date']] if col_map['date'] != -1 else ""
         d_match = re.search(DATE_REGEX, d_val)
         if d_match: 
             sticky_date = d_match.group()
             if global_year and len(sticky_date.split()) < 3:
                 sticky_date = f"{sticky_date} {global_year}"
-
         p_out = to_num(vals[col_map['out']]) if col_map['out'] != -1 else ""
         p_in = to_num(vals[col_map['in']]) if col_map['in'] != -1 else ""
         p_bal = to_num(vals[col_map['bal']]) if col_map['bal'] != -1 else ""
-        
-        # Description: Everything that isn't date or amount
         money_indices = {col_map['out'], col_map['in'], col_map['bal']}
         desc = " ".join([v for i, v in enumerate(vals) if i != col_map['date'] and i not in money_indices and v]).strip()
-
-        # Save Logic
         if "forward" in desc.lower() or "start balance" in desc.lower():
             txns.append({'Date': sticky_date, 'Description': desc, 'Paid Out': '', 'Paid In': '', 'Balance': p_bal or p_in or p_out})
         elif p_out or p_in:
             txns.append({'Date': sticky_date, 'Description': desc, 'Paid Out': p_out, 'Paid In': p_in, 'Balance': p_bal})
         elif txns and desc:
-            # Multi-line description stitch
-            # If current row has no money, it's text for the PREVIOUS or NEXT transaction
-            # In Barclays, text often follows the amount
             txns[-1]['Description'] = (txns[-1]['Description'] + " " + desc).strip()
             if p_bal and not txns[-1]['Balance']: txns[-1]['Balance'] = p_bal
-
     return txns, sticky_date
 
 @app.post("/upload")
@@ -151,7 +127,6 @@ async def get_status(job_id: str, file_key: str = Query(...)):
         response = textract.get_document_analysis(JobId=job_id)
         if response['JobStatus'] == 'IN_PROGRESS': return {"status": "PROCESSING"}
         if response['JobStatus'] == 'FAILED': return {"status": "FAILED"}
-
         if response['JobStatus'] == 'SUCCEEDED':
             all_blocks = response.get('Blocks', [])
             next_token = response.get('NextToken')
@@ -160,9 +135,19 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                 all_blocks.extend(next_page.get('Blocks', []))
                 next_token = next_page.get('NextToken')
             
-            bmap = {b['Id']: b for b in all_blocks}
+            # --- ERROR SHIELD: VALIDATION ---
+            has_tables = any(b['BlockType'] == 'TABLE' for b in all_blocks)
+            full_text = " ".join([b.get('Text', '') for b in all_blocks if b['BlockType'] == 'LINE']).lower()
+            banking_keywords = ["statement", "account", "balance", "date", "transaction", "debit", "credit", "money out", "money in"]
+            keyword_count = sum(1 for word in banking_keywords if word in full_text)
+
+            if not has_tables or keyword_count < 2:
+                return JSONResponse(status_code=422, content={
+                    "status": "ERROR", 
+                    "message": "DocNeat couldn't find a bank statement layout in this file. Please ensure you are uploading a clear, standard PDF statement."
+                })
             
-            # Global Year Finder
+            bmap = {b['Id']: b for b in all_blocks}
             global_year = ""
             for block in all_blocks:
                 if block['BlockType'] == 'LINE':
@@ -171,11 +156,8 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                     if m: 
                         global_year = m.group(1)
                         break
-
             final_data = []
             sticky_date = ""
-            
-            # Filter and Process Tables
             for block in all_blocks:
                 if block['BlockType'] == 'TABLE':
                     grid = {}
@@ -192,30 +174,21 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                                         word_block = bmap.get(word_id)
                                         if word_block: text += word_block.get('Text', '') + " "
                             grid.setdefault(r, {})[c] = text.strip()
-                    
                     if grid:
                         df_table = pd.DataFrame.from_dict(grid, orient='index').sort_index(axis=1)
                         table_txns, sticky_date = parse_bank_agnostic(df_table, sticky_date, global_year)
                         final_data.extend(table_txns)
-
             try: s3.delete_object(Bucket=BUCKET_NAME, Key=file_key)
             except: pass
-
             if not final_data:
                 return {"status": "COMPLETED", "preview": [], "csv_content": ""}
-            
             columns = ['Date', 'Description', 'Paid Out', 'Paid In', 'Balance']
             final_df = pd.DataFrame(final_data, columns=columns).drop_duplicates()
             final_df = final_df.astype(str).replace(['nan', 'None', 'NaN', '0.00'], '')
-            
             return {
                 "status": "COMPLETED",
                 "preview": final_df.head(100).to_dict(orient="records"),
                 "csv_content": final_df.to_csv(index=False)
             }
-            
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Logic Error: {str(e)}", "detail": traceback.format_exc()})
-
-@app.get("/")
-def health(): return {"status": "V46 - High Density Filter Active"}
