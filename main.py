@@ -9,7 +9,6 @@ import pandas as pd
 from fastapi import FastAPI, File, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pypdf import PdfReader  # Integrated for explicit page-credit tracking
 
 app = FastAPI()
 
@@ -115,15 +114,18 @@ async def upload(file: UploadFile = File(...)):
     try:
         content = await file.read()
         
-        # --- NEW CODE: PAGE COUNT DETECTOR ---
+        # --- NATIVE ZERO-DEPENDENCY PAGE COUNT DETECTOR ---
         try:
-            pdf_stream = io.BytesIO(content)
-            reader = PdfReader(pdf_stream)
-            page_count = len(reader.pages)
+            # Standard PDFs contain "/Type /Page" or "/Count" markers. 
+            # We search the raw binary data to safely find the total page structures.
+            matches = re.findall(b'/Type\s*/Page\b', content)
+            page_count = len(matches) if matches else 1
+            if page_count == 0:
+                page_count = 1
         except Exception as pdf_err:
-            print(f"Error parsing PDF page count: {pdf_err}")
-            page_count = 1  # Standard fallback value
-        # -------------------------------------
+            print(f"Error natively reading pages: {pdf_err}")
+            page_count = 1
+        # --------------------------------------------------
 
         s3.put_object(Bucket=BUCKET_NAME, Key=file_key, Body=content)
         response = textract.start_document_analysis(
@@ -133,7 +135,7 @@ async def upload(file: UploadFile = File(...)):
         return {
             "job_id": response['JobId'], 
             "file_key": file_key,
-            "page_count": page_count  # Sent to Next.js immediately upon tracking initialization
+            "page_count": page_count
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
