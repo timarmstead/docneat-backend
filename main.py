@@ -9,6 +9,7 @@ import pandas as pd
 from fastapi import FastAPI, File, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pypdf import PdfReader  # Integrated for explicit page-credit tracking
 
 app = FastAPI()
 
@@ -77,7 +78,6 @@ def parse_bank_agnostic(df, sticky_date, global_year):
     if df.empty: return [], sticky_date
     text_content = df.astype(str).values.flatten()
     date_matches = [t for t in text_content if re.search(DATE_REGEX, t)]
-    # Stronger check: If no dates found in the table, it's likely not a transaction table
     if len(date_matches) == 0:
         return [], sticky_date
 
@@ -114,12 +114,27 @@ async def upload(file: UploadFile = File(...)):
     file_key = f"uploads/{uuid.uuid4()}-{clean_name}"
     try:
         content = await file.read()
+        
+        # --- NEW CODE: PAGE COUNT DETECTOR ---
+        try:
+            pdf_stream = io.BytesIO(content)
+            reader = PdfReader(pdf_stream)
+            page_count = len(reader.pages)
+        except Exception as pdf_err:
+            print(f"Error parsing PDF page count: {pdf_err}")
+            page_count = 1  # Standard fallback value
+        # -------------------------------------
+
         s3.put_object(Bucket=BUCKET_NAME, Key=file_key, Body=content)
         response = textract.start_document_analysis(
             DocumentLocation={'S3Object': {'Bucket': BUCKET_NAME, 'Name': file_key}},
             FeatureTypes=['TABLES']
         )
-        return {"job_id": response['JobId'], "file_key": file_key}
+        return {
+            "job_id": response['JobId'], 
+            "file_key": file_key,
+            "page_count": page_count  # Sent to Next.js immediately upon tracking initialization
+        }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -170,8 +185,6 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                         table_txns, sticky_date = parse_bank_agnostic(df_table, sticky_date, global_year)
                         final_data.extend(table_txns)
             
-            # --- FINAL VALIDATION SHIELD ---
-            # If after all parsing we have NO actual transactions, it's not a statement.
             if not final_data:
                 return JSONResponse(status_code=422, content={
                     "status": "ERROR", 
