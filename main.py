@@ -3,6 +3,7 @@ import os
 import re
 import uuid
 import boto3
+import asyncio
 import traceback
 import numpy as np
 import pandas as pd
@@ -19,6 +20,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Concurrency Guard: Digital bouncer throttling parallel textract analysis streams to 3 active tasks max
+upload_semaphore = asyncio.Semaphore(3)
 
 s3 = boto3.client('s3',
     aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
@@ -111,34 +115,35 @@ def parse_bank_agnostic(df, sticky_date, global_year):
 async def upload(file: UploadFile = File(...)):
     clean_name = re.sub(r'[^a-zA-Z0-9.]', '_', file.filename)
     file_key = f"uploads/{uuid.uuid4()}-{clean_name}"
-    try:
-        content = await file.read()
-        
-        # --- NATIVE ZERO-DEPENDENCY PAGE COUNT DETECTOR ---
+    
+    # Wrap with lock semaphore to ensure bulk parallel uploads queue securely under resource caps
+    async with upload_semaphore:
         try:
-            # Standard PDFs contain "/Type /Page" or "/Count" markers. 
-            # We search the raw binary data to safely find the total page structures.
-            matches = re.findall(b'/Type\s*/Page\b', content)
-            page_count = len(matches) if matches else 1
-            if page_count == 0:
+            content = await file.read()
+            
+            # --- NATIVE ZERO-DEPENDENCY PAGE COUNT DETECTOR ---
+            try:
+                matches = re.findall(b'/Type\s*/Page\b', content)
+                page_count = len(matches) if matches else 1
+                if page_count == 0:
+                    page_count = 1
+            except Exception as pdf_err:
+                print(f"Error natively reading pages: {pdf_err}")
                 page_count = 1
-        except Exception as pdf_err:
-            print(f"Error natively reading pages: {pdf_err}")
-            page_count = 1
-        # --------------------------------------------------
+            # --------------------------------------------------
 
-        s3.put_object(Bucket=BUCKET_NAME, Key=file_key, Body=content)
-        response = textract.start_document_analysis(
-            DocumentLocation={'S3Object': {'Bucket': BUCKET_NAME, 'Name': file_key}},
-            FeatureTypes=['TABLES']
-        )
-        return {
-            "job_id": response['JobId'], 
-            "file_key": file_key,
-            "page_count": page_count
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+            s3.put_object(Bucket=BUCKET_NAME, Key=file_key, Body=content)
+            response = textract.start_document_analysis(
+                DocumentLocation={'S3Object': {'Bucket': BUCKET_NAME, 'Name': file_key}},
+                FeatureTypes=['TABLES']
+            )
+            return {
+                "job_id": response['JobId'], 
+                "file_key": file_key,
+                "page_count": page_count
+            }
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/status/{job_id}")
 async def get_status(job_id: str, file_key: str = Query(...)):
