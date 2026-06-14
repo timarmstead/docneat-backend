@@ -21,7 +21,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Concurrency Guard: Digital bouncer throttling parallel textract analysis streams to 3 active tasks max
 upload_semaphore = asyncio.Semaphore(3)
 
 s3 = boto3.client('s3',
@@ -81,8 +80,7 @@ def parse_bank_agnostic(df, sticky_date, global_year):
     if df.empty: return [], sticky_date
     text_content = df.astype(str).values.flatten()
     date_matches = [t for t in text_content if re.search(DATE_REGEX, t)]
-    if len(date_matches) == 0:
-        return [], sticky_date
+    if len(date_matches) == 0: return [], sticky_date
 
     col_map = find_columns_semantically(df)
     txns = []
@@ -116,21 +114,13 @@ async def upload(file: UploadFile = File(...)):
     clean_name = re.sub(r'[^a-zA-Z0-9.]', '_', file.filename)
     file_key = f"uploads/{uuid.uuid4()}-{clean_name}"
     
-    # Wrap with lock semaphore to ensure bulk parallel uploads queue securely under resource caps
     async with upload_semaphore:
         try:
             content = await file.read()
-            
-            # --- NATIVE ZERO-DEPENDENCY PAGE COUNT DETECTOR ---
             try:
                 matches = re.findall(b'/Type\s*/Page\b', content)
                 page_count = len(matches) if matches else 1
-                if page_count == 0:
-                    page_count = 1
-            except Exception as pdf_err:
-                print(f"Error natively reading pages: {pdf_err}")
-                page_count = 1
-            # --------------------------------------------------
+            except: page_count = 1
 
             s3.put_object(Bucket=BUCKET_NAME, Key=file_key, Body=content)
             response = textract.start_document_analysis(
@@ -159,6 +149,11 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                 all_blocks.extend(next_page.get('Blocks', []))
                 next_token = next_page.get('NextToken')
             
+            # Fetch the original page count stored in S3 metadata or re-estimate
+            # For simplicity, we assume 1 page unless your upload logic persists it
+            # If you need precise pages from Textract, use: response.get('DocumentMetadata', {}).get('Pages', 1)
+            pages = response.get('DocumentMetadata', {}).get('Pages', 1)
+
             bmap = {b['Id']: b for b in all_blocks}
             global_year = ""
             for block in all_blocks:
@@ -193,25 +188,22 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                         final_data.extend(table_txns)
             
             if not final_data:
-                return JSONResponse(status_code=422, content={
-                    "status": "ERROR", 
-                    "message": "DocNeat couldn't identify any transactions in this document. Please ensure it is a standard bank statement with dates and amounts."
-                })
+                return JSONResponse(status_code=422, content={"status": "ERROR", "message": "No transactions found."})
 
             try: s3.delete_object(Bucket=BUCKET_NAME, Key=file_key)
             except: pass
 
-            columns = ['Date', 'Description', 'Paid Out', 'Paid In', 'Balance']
-            final_df = pd.DataFrame(final_data, columns=columns).drop_duplicates()
+            final_df = pd.DataFrame(final_data, columns=['Date', 'Description', 'Paid Out', 'Paid In', 'Balance']).drop_duplicates()
             final_df = final_df.astype(str).replace(['nan', 'None', 'NaN', '0.00'], '')
             
             return {
                 "status": "COMPLETED",
+                "page_count": pages,
                 "preview": final_df.head(100).to_dict(orient="records"),
                 "csv_content": final_df.to_csv(index=False)
             }
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Logic Error: {str(e)}", "detail": traceback.format_exc()})
+        return JSONResponse(status_code=500, content={"error": str(e), "detail": traceback.format_exc()})
 
 @app.get("/")
 def health(): return {"status": "V48 - Final Transaction Validation Active"}
