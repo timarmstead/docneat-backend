@@ -38,6 +38,19 @@ textract = boto3.client('textract',
 BUCKET_NAME = os.getenv('AWS_S3_BUCKET')
 DATE_REGEX = r'\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:\s\d{2,4})?'
 
+# Noise phrases to filter out completely — page artifacts, not real transactions
+NOISE_PHRASES = [
+    "opening balance",
+    "closing balance",
+    "balance carried forward",
+    "balance brought forward",
+    "carried forward",
+    "brought forward",
+    "payment type",
+    "fscs",
+    "page",
+]
+
 def is_clean_num(val):
     if not val: return False
     s = str(val).replace('£','').replace('$','').replace(',','').replace('€','').strip()
@@ -87,15 +100,14 @@ def parse_bank_agnostic(df, sticky_date, global_year):
     for _, row in df.iterrows():
         vals = [str(v).strip() if v is not None and str(v).lower() != 'nan' else "" for v in row.values]
         row_str = " ".join(vals).lower()
-        if any(x in row_str for x in [
-            "opening balance", "closing balance", "payment type", "fscs", "page",
-            "balance carried forward", "carried forward", "balance brought forward",
-            "brought forward"
-        ]):
-            if not "forward" in row_str and not "start balance" in row_str: continue
+
+        # Skip any row that contains a noise phrase
+        if any(phrase in row_str for phrase in NOISE_PHRASES):
+            continue
+
         d_val = vals[col_map['date']] if col_map['date'] != -1 else ""
         d_match = re.search(DATE_REGEX, d_val)
-        if d_match: 
+        if d_match:
             sticky_date = d_match.group()
             if global_year and len(sticky_date.split()) < 3:
                 sticky_date = f"{sticky_date} {global_year}"
@@ -104,9 +116,8 @@ def parse_bank_agnostic(df, sticky_date, global_year):
         p_bal = to_num(vals[col_map['bal']]) if col_map['bal'] != -1 else ""
         money_indices = {col_map['out'], col_map['in'], col_map['bal']}
         desc = " ".join([v for i, v in enumerate(vals) if i != col_map['date'] and i not in money_indices and v]).strip()
-        if "forward" in desc.lower() or "start balance" in desc.lower():
-            txns.append({'Date': sticky_date, 'Description': desc, 'Paid Out': '', 'Paid In': '', 'Balance': p_bal or p_in or p_out})
-        elif p_out or p_in:
+
+        if p_out or p_in:
             txns.append({'Date': sticky_date, 'Description': desc, 'Paid Out': p_out, 'Paid In': p_in, 'Balance': p_bal})
         elif txns and desc:
             txns[-1]['Description'] = (txns[-1]['Description'] + " " + desc).strip()
@@ -132,7 +143,7 @@ async def upload(file: UploadFile = File(...)):
                 FeatureTypes=['TABLES']
             )
             return {
-                "job_id": response['JobId'], 
+                "job_id": response['JobId'],
                 "file_key": file_key,
                 "page_count": page_count
             }
@@ -161,10 +172,10 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                 if block['BlockType'] == 'LINE':
                     txt = block.get('Text', '')
                     m = re.search(r'\b(20\d{2})\b', txt)
-                    if m: 
+                    if m:
                         global_year = m.group(1)
                         break
-            
+
             final_data = []
             sticky_date = ""
             for block in all_blocks:
@@ -187,7 +198,7 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                         df_table = pd.DataFrame.from_dict(grid, orient='index').sort_index(axis=1)
                         table_txns, sticky_date = parse_bank_agnostic(df_table, sticky_date, global_year)
                         final_data.extend(table_txns)
-            
+
             if not final_data:
                 return JSONResponse(status_code=422, content={"status": "ERROR", "message": "No transactions found."})
 
@@ -196,7 +207,7 @@ async def get_status(job_id: str, file_key: str = Query(...)):
 
             final_df = pd.DataFrame(final_data, columns=['Date', 'Description', 'Paid Out', 'Paid In', 'Balance']).drop_duplicates()
             final_df = final_df.astype(str).replace(['nan', 'None', 'NaN', '0.00'], '')
-            
+
             return {
                 "status": "COMPLETED",
                 "page_count": pages,
@@ -207,4 +218,4 @@ async def get_status(job_id: str, file_key: str = Query(...)):
         return JSONResponse(status_code=500, content={"error": str(e), "detail": traceback.format_exc()})
 
 @app.get("/")
-def health(): return {"status": "V49 - Balance Carried Forward Filter Active"}
+def health(): return {"status": "V50 - Hard Filter for Balance Forward Rows Active"}
