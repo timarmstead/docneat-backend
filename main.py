@@ -87,7 +87,11 @@ def parse_bank_agnostic(df, sticky_date, global_year):
     for _, row in df.iterrows():
         vals = [str(v).strip() if v is not None and str(v).lower() != 'nan' else "" for v in row.values]
         row_str = " ".join(vals).lower()
-        if any(x in row_str for x in ["opening balance", "closing balance", "payment type", "fscs", "page"]):
+        if any(x in row_str for x in [
+            "opening balance", "closing balance", "payment type", "fscs", "page",
+            "balance carried forward", "carried forward", "balance brought forward",
+            "brought forward"
+        ]):
             if not "forward" in row_str and not "start balance" in row_str: continue
         d_val = vals[col_map['date']] if col_map['date'] != -1 else ""
         d_match = re.search(DATE_REGEX, d_val)
@@ -148,10 +152,7 @@ async def get_status(job_id: str, file_key: str = Query(...)):
                 next_page = textract.get_document_analysis(JobId=job_id, NextToken=next_token)
                 all_blocks.extend(next_page.get('Blocks', []))
                 next_token = next_page.get('NextToken')
-            
-            # Fetch the original page count stored in S3 metadata or re-estimate
-            # For simplicity, we assume 1 page unless your upload logic persists it
-            # If you need precise pages from Textract, use: response.get('DocumentMetadata', {}).get('Pages', 1)
+
             pages = response.get('DocumentMetadata', {}).get('Pages', 1)
 
             bmap = {b['Id']: b for b in all_blocks}
@@ -206,4 +207,4 @@ async def get_status(job_id: str, file_key: str = Query(...)):
         return JSONResponse(status_code=500, content={"error": str(e), "detail": traceback.format_exc()})
 
 @app.get("/")
-def health(): return {"status": "V48 - Final Transaction Validation Active"}
+def health(): return {"status": "V49 - Balance Carried Forward Filter Active"}
